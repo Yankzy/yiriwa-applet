@@ -7,7 +7,7 @@ import org.globalplatform.*;
 
 /**
  * =========================================================================================
- * Yiriwa Trusted Carrier Applet v4.0 (ZK-Carrier Protocol)
+ * Yiriwa Trusted Carrier Applet v4.1 (ZK-Carrier Protocol)
  * =========================================================================================
  *
  * OVERVIEW:
@@ -16,12 +16,11 @@ import org.globalplatform.*;
  * trust anchor from the Merchant to the Secure Element (SE).
  *
  * -----------------------------------------------------------------------------------------
- * CORE INNOVATION: ATOMIC COMPRESSION & SIGNING
+ * CORE INNOVATION: ATOMIC COMPRESSION & STORAGE
  * Instead of storing full JSON logs, the Applet:
  * 1. Accepts raw transaction data (Amount, MerchantID, Item).
  * 2. Compresses it using internal logic (Base62 decoding + Bit-packing).
- * 3. Signs the compressed blob with the Card's Private Key.
- * 4. Stores the blob atomically with the balance decrement.
+ * 3. Stores the blob atomically with the balance decrement.
  *
  * [Storage Format - 6 Bytes]
  * Byte 0-2: Merchant ID (Compressed from 4 Base62 chars)
@@ -33,7 +32,7 @@ import org.globalplatform.*;
  * CLA: 0x80 (0x84 for SCP03 Wrapped)
  *
  * [INS_GET_LAST_LOG - 0x50]
- * - Returns: [Compressed_Blob (6B)] [Signature_Len (2B)] [Signature (Var)]
+ * - Returns: [Compressed_Blob (6B)]
  *
  * [INS_DEBIT - 0x40]
  * - Input: [Amount (2B)] [MID_String (4B)] [Item_ID (1B)]
@@ -70,14 +69,11 @@ public class YiriwaApplet extends Applet {
     
     // THE CARRIER PAYLOAD (Storage Optimized)
     private byte[] lastLogData;      // Fixed 6 bytes
-    private byte[] lastLogSignature; // Max ~72 bytes for ECDSA
-    private short  lastLogSigLen;    // Actual length of current sig
+    // Removed Signature fields to save EEPROM space
 
     // -------------------------------------------------------------------------
     // Crypto (RAM)
     // -------------------------------------------------------------------------
-    private KeyPair keyPair;
-    private Signature ecdsaSignature;
     private SecureChannel secureChannel;
     private byte[] scratchBuffer;
 
@@ -95,18 +91,9 @@ public class YiriwaApplet extends Applet {
         
         // Alloc storage for the Compressed Blob
         lastLogData = new byte[6]; 
-        lastLogSignature = new byte[80]; // Buffer for sig
-        lastLogSigLen = 0;
+        // No signature allocation needed
 
-        // 3. Crypto Init
-        try {
-            keyPair = new KeyPair(KeyPair.ALG_EC_FP, KeyBuilder.LENGTH_EC_FP_256);
-            keyPair.genKeyPair();
-            ecdsaSignature = Signature.getInstance(Signature.ALG_ECDSA_SHA_256, false);
-        } catch (Exception e) {
-            ISOException.throwIt(ISO7816.SW_FUNC_NOT_SUPPORTED);
-        }
-
+        // 3. System Init
         secureChannel = GPSystem.getSecureChannel();
         scratchBuffer = JCSystem.makeTransientByteArray((short) 128, JCSystem.CLEAR_ON_DESELECT);
 
@@ -144,7 +131,6 @@ public class YiriwaApplet extends Applet {
                 break;
             case INS_GET_LAST_LOG:
                 // Allows Merchant B to "Harvest" the previous state
-                // No PIN required for harvesting (public audit), but usually Auth required
                 returnLastLog(apdu);
                 break;
             case INS_DEBIT:
@@ -159,7 +145,7 @@ public class YiriwaApplet extends Applet {
     // --- Core Logic ----------------------------------------------------------
 
     /**
-     * INS_DEBIT: Atomic Debit + Compression + Signing
+     * INS_DEBIT: Atomic Debit + Compression
      * Input: [Amount(2)] [MID_String(4)] [Item_ID(1)] = 7 Bytes
      */
     private void processAtomicDebitAndLog(APDU apdu) {
@@ -187,13 +173,9 @@ public class YiriwaApplet extends Applet {
         // Output goes to scratchBuffer[0..5]
         compressAndPack(buffer, midOffset, amount, itemID, scratchBuffer, (short) 0);
 
-        // 4. Sign the Compressed Blob
-        ecdsaSignature.init(keyPair.getPrivate(), Signature.MODE_SIGN);
-        // Sign the 6 bytes in scratchBuffer
-        short sigLen = ecdsaSignature.sign(scratchBuffer, (short) 0, (short) 6, scratchBuffer, (short) 10);
-        // Signature is now at scratchBuffer[10...10+sigLen]
-
-        // 5. ATOMIC COMMIT (Debit + Log Overwrite)
+        // 4. ATOMIC COMMIT (Debit + Log Overwrite)
+        // Note: No signing performed. The hardware trust boundary ensures
+        // that if 'lastLogData' exists, it was created by this logic.
         JCSystem.beginTransaction();
         try {
             // A. Debit
@@ -202,23 +184,19 @@ public class YiriwaApplet extends Applet {
             // B. Store Log Data (6 Bytes)
             Util.arrayCopy(scratchBuffer, (short) 0, lastLogData, (short) 0, (short) 6);
 
-            // C. Store Signature
-            lastLogSigLen = sigLen;
-            Util.arrayCopy(scratchBuffer, (short) 10, lastLogSignature, (short) 0, sigLen);
-
             JCSystem.commitTransaction();
         } catch (Exception e) {
             JCSystem.abortTransaction();
             ISOException.throwIt(ISO7816.SW_UNKNOWN);
         }
 
-        // 6. Response (Success)
+        // 5. Response (Success)
         sendSecureResponse(apdu, (short) 0);
     }
 
     /**
      * INS_GET_LAST_LOG
-     * Response: [Blob(6)] [SigLen(2)] [Sig(Var)]
+     * Response: [Blob(6)]
      */
     private void returnLastLog(APDU apdu) {
         byte[] buffer = apdu.getBuffer();
@@ -226,13 +204,7 @@ public class YiriwaApplet extends Applet {
         // 1. Copy Blob
         Util.arrayCopy(lastLogData, (short) 0, buffer, (short) 0, (short) 6);
         
-        // 2. Copy Sig Len
-        Util.setShort(buffer, (short) 6, lastLogSigLen);
-        
-        // 3. Copy Signature
-        Util.arrayCopy(lastLogSignature, (short) 0, buffer, (short) 8, lastLogSigLen);
-        
-        apdu.setOutgoingAndSend((short) 0, (short)(8 + lastLogSigLen));
+        apdu.setOutgoingAndSend((short) 0, (short) 6);
     }
 
     // --- Helper: Compression Engine ------------------------------------------
