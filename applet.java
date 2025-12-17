@@ -7,158 +7,108 @@ import org.globalplatform.*;
 
 /**
  * =========================================================================================
- * Yiriwa Offline Protocol (YOP) - Wallet Applet v3.0 (Patent Pending)
+ * Yiriwa Trusted Carrier Applet v4.0 (ZK-Carrier Protocol)
  * =========================================================================================
  *
  * OVERVIEW:
- * This Java Card applet implements the "Prover" side of the Yiriwa Offline Protocol v3.0.
- * It is designed for secure, offline, atomic value transfer with a unique "Viral Audit"
- * mechanism that entangles transaction histories between peers to detect fraud without
- * real-time connectivity.
+ * This Applet implements the "Trusted Applet-Driven Compression" mechanism.
+ * Ideally suited for constrained storage environments, it shifts the compression
+ * trust anchor from the Merchant to the Secure Element (SE).
  *
  * -----------------------------------------------------------------------------------------
- * CORE SECURITY FEATURES:
- * 1. GlobalPlatform SCP03:
- * - All sensitive APDUs (PIN verification, Debit) must be wrapped in a Secure Channel.
- * - Provides confidentiality (Encryption) and integrity (MAC) to prevent sniffing and
- * MITM attacks over the NFC interface.
+ * CORE INNOVATION: ATOMIC COMPRESSION & SIGNING
+ * Instead of storing full JSON logs, the Applet:
+ * 1. Accepts raw transaction data (Amount, MerchantID, Item).
+ * 2. Compresses it using internal logic (Base62 decoding + Bit-packing).
+ * 3. Signs the compressed blob with the Card's Private Key.
+ * 4. Stores the blob atomically with the balance decrement.
  *
- * 2. Two-Factor Authentication (CVM):
- * - Uses `OwnerPIN` to enforce user authorization.
- * - The `DEBIT` and `GET_BALANCE` commands throw SW_PIN_VERIFICATION_REQUIRED if the
- * PIN has not been validated in the current session.
- *
- * 3. Atomic Transactions:
- * - Uses `JCSystem.beginTransaction()` and `commitTransaction()` to ensure that
- * balance decrements and nonce increments are atomic. Protection against "tearing"
- * (power loss during write).
+ * [Storage Format - 6 Bytes]
+ * Byte 0-2: Merchant ID (Compressed from 4 Base62 chars)
+ * Byte 3-4: Amount (Unsigned Short)
+ * Byte 5:   Item Category ID
  *
  * -----------------------------------------------------------------------------------------
- * PATENTED LOGIC: "Viral Hash Entanglement" (The v3.0 Upgrade)
- * Unlike standard EMV offline counters, YOP v3.0 creates a distributed mesh of evidence.
+ * APDU INTERFACE:
+ * CLA: 0x80 (0x84 for SCP03 Wrapped)
  *
- * [The Entanglement Formula]
- * Current_Tx_Hash = SHA256(
- * Amount (4B) || Nonce (4B) || MerchantID (8B) || CardID (8B) ||
- * H_Card_Last (32B) ||  <-- The User's previous state
- * H_Term_Last (32B)     <-- The Merchant's previous state (injected via APDU)
- * )
+ * [INS_GET_LAST_LOG - 0x50]
+ * - Returns: [Compressed_Blob (6B)] [Signature_Len (2B)] [Signature (Var)]
  *
- * [The Viral Effect]
- * By signing this `Current_Tx_Hash`, the Card cryptographically attests to the state of
- * the Merchant (Terminal). When this Card is used at a *different* Merchant later, it
- * effectively transports proof of the first Merchant's state to the central ledger.
- * This makes it mathematically impossible for a Merchant to modify their local logs
- * without being detected by the "Viral" audit trail carried by users.
- *
+ * [INS_DEBIT - 0x40]
+ * - Input: [Amount (2B)] [MID_String (4B)] [Item_ID (1B)]
+ * - Logic: Decrements balance AND overwrites the Last Log in one atomic commit.
  * -----------------------------------------------------------------------------------------
- * APDU INTERFACE SPECIFICATION:
- * CLA: 0x80 (Cleartext handshake) / 0x84 (Secure Channel Wrapped)
- *
- * [INS_VERIFY_PIN - 0x20]
- * - Payload: ASCII PIN (e.g., "1234")
- * - Security: Must be wrapped (SCP03)
- *
- * [INS_GET_BALANCE - 0x30]
- * - Response: 8-byte Big Endian Integer (Wrapped)
- *
- * [INS_DEBIT - 0x40] (The Entangled Swap)
- * - Input (48 Bytes): [Amount: 4] [MerchantID: 8] [TermNonce: 4] [H_Term_Last: 32]
- * - Output: [Signature: Var] [Current_Tx_Hash: 32] [New_Nonce: 4]
- *
- * -----------------------------------------------------------------------------------------
- * HARDWARE REQUIREMENTS:
- * - Java Card 3.0.5 or higher.
- * - GlobalPlatform 2.2.1+ with SCP03 support.
- * - NXP JCOP J3R180 or equivalent Secure Element.
- * - Available RAM: ~512 bytes for crypto buffers.
- *
- * =========================================================================================
  */
 public class YiriwaApplet extends Applet {
 
     // -------------------------------------------------------------------------
-    // Constants & Instructions
+    // Constants
     // -------------------------------------------------------------------------
-    private static final byte CLA_YIRIWA            = (byte) 0x80;
+    private static final byte CLA_YIRIWA          = (byte) 0x80;
     
-    private static final byte INS_VERIFY_PIN        = (byte) 0x20;
-    private static final byte INS_GET_BALANCE       = (byte) 0x30;
-    private static final byte INS_DEBIT             = (byte) 0x40;
+    private static final byte INS_VERIFY_PIN      = (byte) 0x20;
+    private static final byte INS_GET_BALANCE     = (byte) 0x30;
+    private static final byte INS_DEBIT           = (byte) 0x40; // Overwrite old log
+    private static final byte INS_GET_LAST_LOG    = (byte) 0x50; // Harvest old log
 
-    // GlobalPlatform specific instructions for Secure Channel Handshake
+    // GlobalPlatform
     private static final byte INS_GP_INITIALIZE_UPDATE = (byte) 0x50;
     private static final byte INS_GP_EXTERNAL_AUTH     = (byte) 0x82;
     
     // Status Words
-    private static final short SW_PIN_VERIFICATION_REQUIRED = (short) 0x6301;
-    private static final short SW_NEGATIVE_BALANCE          = (short) 0x6910;
-    private static final short SW_INVALID_AMOUNT            = (short) 0x6911;
-    private static final short SW_SECURE_CHANNEL_REQUIRED   = (short) 0x6982;
+    private static final short SW_PIN_REQUIRED     = (short) 0x6301;
+    private static final short SW_INSUFFICIENT_FUNDS = (short) 0x6910;
+    private static final short SW_INVALID_FORMAT     = (short) 0x6911;
+    private static final short SW_SECURE_CHANNEL     = (short) 0x6982;
 
     // -------------------------------------------------------------------------
-    // Persistent State (EEPROM)
+    // State (EEPROM)
     // -------------------------------------------------------------------------
     private OwnerPIN userPin;
-    private long shadowBalance; 
-    private int nonce;
+    private short balance; // Simplified to short for demo (0-32767)
     
-    // v3.0 ENTANGLEMENT STATE
-    // This is the "Chain" carried by the user.
-    // It starts as 32-bytes of zeros (Genesis Hash).
-    private byte[] lastTxHash;
-    
-    // Unique Card ID (Injected during Personalization)
-    private byte[] cardId; 
+    // THE CARRIER PAYLOAD (Storage Optimized)
+    private byte[] lastLogData;      // Fixed 6 bytes
+    private byte[] lastLogSignature; // Max ~72 bytes for ECDSA
+    private short  lastLogSigLen;    // Actual length of current sig
 
     // -------------------------------------------------------------------------
-    // Crypto Objects (RAM)
+    // Crypto (RAM)
     // -------------------------------------------------------------------------
     private KeyPair keyPair;
     private Signature ecdsaSignature;
-    private MessageDigest sha256;
     private SecureChannel secureChannel;
-    
-    // Temporary RAM buffer for crypto operations (Performance optimization)
-    private byte[] scratchBuffer; 
+    private byte[] scratchBuffer;
 
     /**
-     * Constructor: Initializes memory and keys.
+     * Constructor
      */
     private YiriwaApplet(byte[] bArray, short bOffset, byte bLength) {
-        // 1. Initialize PIN (Limit: 3 tries, Length: 8)
+        // 1. PIN Init
         userPin = new OwnerPIN((byte) 3, (byte) 8);
-        // Default PIN "1234" for development
         byte[] defaultPin = {(byte) 0x31, (byte) 0x32, (byte) 0x33, (byte) 0x34};
         userPin.update(defaultPin, (short) 0, (byte) defaultPin.length);
 
-        // 2. Initialize Wallet State
-        shadowBalance = 10000; // Demo Start Balance
-        nonce = 1;             // Monotonic Counter
+        // 2. State Init
+        balance = 10000; 
         
-        // 3. Initialize Audit Chain
-        lastTxHash = new byte[32]; // 0000...0000
-        // Demo Card ID
-        cardId = new byte[] { 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08 }; 
+        // Alloc storage for the Compressed Blob
+        lastLogData = new byte[6]; 
+        lastLogSignature = new byte[80]; // Buffer for sig
+        lastLogSigLen = 0;
 
-        // 4. Initialize Crypto Engines
+        // 3. Crypto Init
         try {
-            // SECP256R1 Curve
             keyPair = new KeyPair(KeyPair.ALG_EC_FP, KeyBuilder.LENGTH_EC_FP_256);
             keyPair.genKeyPair();
-            
-            // Sign using SHA-256 hash
             ecdsaSignature = Signature.getInstance(Signature.ALG_ECDSA_SHA_256, false);
-            sha256 = MessageDigest.getInstance(MessageDigest.ALG_SHA_256, false);
         } catch (Exception e) {
             ISOException.throwIt(ISO7816.SW_FUNC_NOT_SUPPORTED);
         }
 
-        // 5. Get Reference to GlobalPlatform Secure Channel
         secureChannel = GPSystem.getSecureChannel();
-        
-        // 6. Alloc RAM
-        scratchBuffer = JCSystem.makeTransientByteArray((short) 256, JCSystem.CLEAR_ON_DESELECT);
+        scratchBuffer = JCSystem.makeTransientByteArray((short) 128, JCSystem.CLEAR_ON_DESELECT);
 
         register();
     }
@@ -167,9 +117,6 @@ public class YiriwaApplet extends Applet {
         new YiriwaApplet(bArray, bOffset, bLength);
     }
 
-    /**
-     * Main APDU Dispatcher
-     */
     public void process(APDU apdu) {
         if (selectingApplet()) return;
 
@@ -177,16 +124,14 @@ public class YiriwaApplet extends Applet {
         byte ins = buffer[ISO7816.OFFSET_INS];
         byte cla = buffer[ISO7816.OFFSET_CLA];
 
-        // 1. Pass Secure Channel Handshake commands directly to GlobalPlatform
+        // GP Secure Channel Passthrough
         if (cla == (byte) 0x80 && (ins == INS_GP_INITIALIZE_UPDATE || ins == INS_GP_EXTERNAL_AUTH)) {
             secureChannel.processSecurity(apdu);
             return;
         }
 
-        // 2. Filter Custom Commands
-        if ((cla & (byte) 0xFC) != CLA_YIRIWA) {
-            ISOException.throwIt(ISO7816.SW_CLA_NOT_SUPPORTED);
-        }
+        // Applet Commands
+        if ((cla & (byte) 0xFC) != CLA_YIRIWA) ISOException.throwIt(ISO7816.SW_CLA_NOT_SUPPORTED);
 
         switch (ins) {
             case INS_VERIFY_PIN:
@@ -197,171 +142,181 @@ public class YiriwaApplet extends Applet {
                 enforceSecureChannel(apdu);
                 getBalance(apdu);
                 break;
+            case INS_GET_LAST_LOG:
+                // Allows Merchant B to "Harvest" the previous state
+                // No PIN required for harvesting (public audit), but usually Auth required
+                returnLastLog(apdu);
+                break;
             case INS_DEBIT:
                 enforceSecureChannel(apdu);
-                processDebitEntangled(apdu); // The v3.0 Logic
+                processAtomicDebitAndLog(apdu);
                 break;
             default:
                 ISOException.throwIt(ISO7816.SW_INS_NOT_SUPPORTED);
         }
     }
 
-    /**
-     * Security Guard: Ensures APDU is encrypted/MAC'd before processing.
-     * Unwraps the APDU in place.
-     */
-    private void enforceSecureChannel(APDU apdu) {
-        byte level = secureChannel.getSecurityLevel();
-        // Require C_DECRYPTION (Privacy) and C_MAC (Integrity)
-        if ((level & (SecureChannel.C_DECRYPTION | SecureChannel.C_MAC)) == 0) {
-            ISOException.throwIt(SW_SECURE_CHANNEL_REQUIRED);
-        }
-        
-        try {
-            short incomingLen = apdu.setIncomingAndReceive();
-            // Unwrap modifies buffer: decrypts data and verifies MAC
-            short clearDataLen = secureChannel.unwrap(apdu.getBuffer(), (short) 0, (short)(incomingLen + 5)); 
-            apdu.setIncomingLength(clearDataLen); 
-        } catch (Exception e) {
-            // Bad MAC or Decryption failure
-            ISOException.throwIt(ISO7816.SW_SECURITY_STATUS_NOT_SATISFIED);
-        }
-    }
+    // --- Core Logic ----------------------------------------------------------
 
     /**
-     * Helper: Encrypts and sends response
+     * INS_DEBIT: Atomic Debit + Compression + Signing
+     * Input: [Amount(2)] [MID_String(4)] [Item_ID(1)] = 7 Bytes
      */
-    private void sendSecureResponse(APDU apdu, short len) {
-        short secureLen = secureChannel.wrap(apdu.getBuffer(), (short) 0, len);
-        apdu.setOutgoingAndSend((short) 0, secureLen);
-    }
-
-    /**
-     * PIN Verification
-     */
-    private void verifyPin(APDU apdu) {
-         byte[] buffer = apdu.getBuffer();
-         // buffer contains plaintext PIN after unwrap
-         byte byteRead = (byte) buffer[ISO7816.OFFSET_LC];
-         
-         if (userPin.check(buffer, ISO7816.OFFSET_CDATA, byteRead) == false) {
-             ISOException.throwIt(ISO7816.SW_SECURITY_STATUS_NOT_SATISFIED);
-         }
-         // Success
-         sendSecureResponse(apdu, (short) 0);
-    }
-    
-    /**
-     * Get Balance
-     */
-    private void getBalance(APDU apdu) {
-        if (!userPin.isValidated()) ISOException.throwIt(SW_PIN_VERIFICATION_REQUIRED);
-        
-        byte[] buffer = apdu.getBuffer();
-        Util.setShort(buffer, (short) 0, (short) 0);
-        Util.setShort(buffer, (short) 2, (short) 0);
-        Util.setShort(buffer, (short) 4, (short) (shadowBalance >> 16));
-        Util.setShort(buffer, (short) 6, (short) shadowBalance);
-        
-        sendSecureResponse(apdu, (short) 8);
-    }
-
-    /**
-     * v3.0 PATENT LOGIC: "Entangled Debit"
-     * * Input Payload (48 Bytes):
-     * [Amount: 4] [MerchantID: 8] [TermNonce: 4] [H_Term_Last: 32]
-     * * Logic:
-     * 1. Check Balance.
-     * 2. Atomic Decrement.
-     * 3. Construct "Entangled Block":
-     * Block = Amount + Nonce + MerchID + CardID + H_Card_Last + H_Term_Last
-     * 4. Hash the Block -> Current_Tx_Hash
-     * 5. Update H_Card_Last = Current_Tx_Hash
-     * 6. Sign Current_Tx_Hash
-     */
-    private void processDebitEntangled(APDU apdu) {
-        if (!userPin.isValidated()) ISOException.throwIt(SW_PIN_VERIFICATION_REQUIRED);
+    private void processAtomicDebitAndLog(APDU apdu) {
+        if (!userPin.isValidated()) ISOException.throwIt(SW_PIN_REQUIRED);
 
         byte[] buffer = apdu.getBuffer();
         short offset = ISO7816.OFFSET_CDATA;
 
-        // --- 1. PARSE & CHECK ---
-        int amount = Util.makeShort(buffer[offset], buffer[(short)(offset+1)]) << 16 |
-                     (Util.makeShort(buffer[(short)(offset+2)], buffer[(short)(offset+3)]) & 0xFFFF);
+        // 1. Parse Inputs
+        // Amount (2 bytes)
+        short amount = Util.makeShort(buffer[offset], buffer[(short)(offset+1)]);
+        
+        // Merchant ID (4 bytes ASCII, e.g., "0uAi")
+        short midOffset = (short)(offset + 2);
+        
+        // Item ID (1 byte)
+        byte itemID = buffer[(short)(offset + 6)];
 
-        if (amount <= 0) ISOException.throwIt(SW_INVALID_AMOUNT);
-        if (shadowBalance < amount) ISOException.throwIt(SW_NEGATIVE_BALANCE);
+        // 2. Financial Validation
+        if (amount <= 0) ISOException.throwIt(SW_INVALID_FORMAT);
+        if (balance < amount) ISOException.throwIt(SW_INSUFFICIENT_FUNDS);
 
-        // --- 2. ATOMIC STATE UPDATE ---
+        // 3. Compress Data (The Innovation)
+        // We do this BEFORE opening the transaction to fail fast if inputs are bad
+        // Output goes to scratchBuffer[0..5]
+        compressAndPack(buffer, midOffset, amount, itemID, scratchBuffer, (short) 0);
+
+        // 4. Sign the Compressed Blob
+        ecdsaSignature.init(keyPair.getPrivate(), Signature.MODE_SIGN);
+        // Sign the 6 bytes in scratchBuffer
+        short sigLen = ecdsaSignature.sign(scratchBuffer, (short) 0, (short) 6, scratchBuffer, (short) 10);
+        // Signature is now at scratchBuffer[10...10+sigLen]
+
+        // 5. ATOMIC COMMIT (Debit + Log Overwrite)
         JCSystem.beginTransaction();
         try {
-            shadowBalance = shadowBalance - amount;
-            nonce++;
+            // A. Debit
+            balance = (short)(balance - amount);
+
+            // B. Store Log Data (6 Bytes)
+            Util.arrayCopy(scratchBuffer, (short) 0, lastLogData, (short) 0, (short) 6);
+
+            // C. Store Signature
+            lastLogSigLen = sigLen;
+            Util.arrayCopy(scratchBuffer, (short) 10, lastLogSignature, (short) 0, sigLen);
+
             JCSystem.commitTransaction();
         } catch (Exception e) {
             JCSystem.abortTransaction();
             ISOException.throwIt(ISO7816.SW_UNKNOWN);
         }
 
-        // --- 3. CONSTRUCT ENTANGLED BLOCK (In Scratch RAM) ---
-        // Structure: Amount(4) | Nonce(4) | MerchID(8) | CardID(8) | H_Card_Last(32) | H_Term_Last(32)
-        // Total Size: 88 Bytes
-        
-        short hashOff = 0;
-        
-        // A. Copy Amount (From APDU)
-        Util.arrayCopy(buffer, offset, scratchBuffer, hashOff, (short) 4); 
-        hashOff += 4;
-        
-        // B. Copy Nonce (From State)
-        Util.setShort(scratchBuffer, hashOff, (short) (nonce >> 16));
-        Util.setShort(scratchBuffer, (short)(hashOff+2), (short) nonce);
-        hashOff += 4;
-        
-        // C. Copy MerchantID (From APDU)
-        Util.arrayCopy(buffer, (short)(offset+4), scratchBuffer, hashOff, (short) 8); 
-        hashOff += 8;
-        
-        // D. Copy CardID (From State)
-        Util.arrayCopy(cardId, (short) 0, scratchBuffer, hashOff, (short) 8);
-        hashOff += 8;
-        
-        // E. Copy H_Card_Last (From State - The User's Chain)
-        Util.arrayCopy(lastTxHash, (short) 0, scratchBuffer, hashOff, (short) 32);
-        hashOff += 32;
-        
-        // F. Copy H_Term_Last (From APDU - The "Viral" Hook)
-        // Offset input was: CDATA + 4(Amt) + 8(Merch) + 4(TNonce) = CDATA + 16
-        Util.arrayCopy(buffer, (short)(offset+16), scratchBuffer, hashOff, (short) 32);
-        hashOff += 32;
+        // 6. Response (Success)
+        sendSecureResponse(apdu, (short) 0);
+    }
 
-        // --- 4. COMPUTE SHA-256 ---
-        // Result goes to scratchBuffer offset 128
-        short hashResultOff = (short) 128;
-        sha256.doFinal(scratchBuffer, (short) 0, hashOff, scratchBuffer, hashResultOff);
+    /**
+     * INS_GET_LAST_LOG
+     * Response: [Blob(6)] [SigLen(2)] [Sig(Var)]
+     */
+    private void returnLastLog(APDU apdu) {
+        byte[] buffer = apdu.getBuffer();
+        
+        // 1. Copy Blob
+        Util.arrayCopy(lastLogData, (short) 0, buffer, (short) 0, (short) 6);
+        
+        // 2. Copy Sig Len
+        Util.setShort(buffer, (short) 6, lastLogSigLen);
+        
+        // 3. Copy Signature
+        Util.arrayCopy(lastLogSignature, (short) 0, buffer, (short) 8, lastLogSigLen);
+        
+        apdu.setOutgoingAndSend((short) 0, (short)(8 + lastLogSigLen));
+    }
 
-        // --- 5. UPDATE CHAIN ---
-        JCSystem.beginTransaction();
-        Util.arrayCopy(scratchBuffer, hashResultOff, lastTxHash, (short) 0, (short) 32);
-        JCSystem.commitTransaction();
+    // --- Helper: Compression Engine ------------------------------------------
 
-        // --- 6. SIGN THE HASH ---
-        ecdsaSignature.init(keyPair.getPrivate(), Signature.MODE_SIGN);
-        // Signing the 32-byte Hash directly
-        short sigLen = ecdsaSignature.sign(scratchBuffer, hashResultOff, (short) 32, buffer, (short) 0);
+    /**
+     * Compresses the transaction into 6 bytes.
+     * Logic:
+     * - Convert 4-char Base62 MID -> 3-byte Integer (24 bits)
+     * - Pack Amount (16 bits)
+     * - Pack Item (8 bits)
+     * Total: 48 bits = 6 bytes.
+     */
+    private void compressAndPack(byte[] src, short midOff, short amount, byte item, byte[] dest, short destOff) {
+        // A. Base62 Compression (4 bytes -> 3 bytes)
+        // val = c0*62^3 + c1*62^2 + c2*62^1 + c3
+        // We use 'int' (32-bit) accumulator. 
+        // Note: 62^3 = 238,328. 4 chars fits in signed int (max 2B).
         
-        // --- 7. RESPONSE ---
-        // Return: Signature(Var) || Current_Tx_Hash(32) || New_Nonce(4)
+        int acc = 0;
+        int power = 238328; // 62^3
         
-        // Append Hash after Sig
-        Util.arrayCopy(scratchBuffer, hashResultOff, buffer, sigLen, (short) 32);
-        short respOff = (short)(sigLen + 32);
-        
-        // Append New Nonce after Hash
-        Util.setShort(buffer, respOff, (short) (nonce >> 16));
-        Util.setShort(buffer, (short)(respOff+2), (short) nonce);
-        
-        // Encrypt and Send
-        sendSecureResponse(apdu, (short) (respOff + 4));
+        for (short i = 0; i < 4; i++) {
+            byte charByte = src[(short)(midOff + i)];
+            short val = mapBase62(charByte);
+            acc += (val * power);
+            power /= 62;
+        }
+
+        // Write 3 bytes of MID (from 32-bit int)
+        // We skip the highest byte (which should be 0)
+        dest[destOff]     = (byte) (acc >> 16);
+        dest[(short)(destOff+1)] = (byte) (acc >> 8);
+        dest[(short)(destOff+2)] = (byte) (acc);
+
+        // B. Write Amount (2 bytes)
+        Util.setShort(dest, (short)(destOff+3), amount);
+
+        // C. Write Item (1 byte)
+        dest[(short)(destOff+5)] = item;
+    }
+
+    /**
+     * Maps ASCII [0-9, A-Z, a-z] to 0-61.
+     */
+    private short mapBase62(byte c) {
+        if (c >= '0' && c <= '9') return (short)(c - '0');       // 0-9
+        if (c >= 'A' && c <= 'Z') return (short)(c - 'A' + 10);  // 10-35
+        if (c >= 'a' && c <= 'z') return (short)(c - 'a' + 36);  // 36-61
+        ISOException.throwIt(SW_INVALID_FORMAT);
+        return 0;
+    }
+
+    // --- Boilerplate Helpers -------------------------------------------------
+
+    private void enforceSecureChannel(APDU apdu) {
+        byte level = secureChannel.getSecurityLevel();
+        if ((level & (SecureChannel.C_DECRYPTION | SecureChannel.C_MAC)) == 0) {
+            ISOException.throwIt(SW_SECURE_CHANNEL);
+        }
+        try {
+            short len = apdu.setIncomingAndReceive();
+            short clearLen = secureChannel.unwrap(apdu.getBuffer(), (short) 0, (short)(len + 5));
+            apdu.setIncomingLength(clearLen);
+        } catch (Exception e) {
+            ISOException.throwIt(ISO7816.SW_SECURITY_STATUS_NOT_SATISFIED);
+        }
+    }
+
+    private void sendSecureResponse(APDU apdu, short len) {
+        short secureLen = secureChannel.wrap(apdu.getBuffer(), (short) 0, len);
+        apdu.setOutgoingAndSend((short) 0, secureLen);
+    }
+
+    private void verifyPin(APDU apdu) {
+        byte[] buf = apdu.getBuffer();
+        if (!userPin.check(buf, ISO7816.OFFSET_CDATA, (byte) buf[ISO7816.OFFSET_LC])) {
+            ISOException.throwIt(ISO7816.SW_SECURITY_STATUS_NOT_SATISFIED);
+        }
+        sendSecureResponse(apdu, (short) 0);
+    }
+
+    private void getBalance(APDU apdu) {
+        byte[] buf = apdu.getBuffer();
+        Util.setShort(buf, (short) 0, balance);
+        sendSecureResponse(apdu, (short) 2);
     }
 }
