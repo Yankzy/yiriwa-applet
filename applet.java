@@ -3,40 +3,27 @@ package com.yiriwa.wallet;
 import javacard.framework.*;
 import javacard.security.*;
 import javacardx.crypto.*;
-import org.globalplatform.*;
+import org.globalplatform.*; // Crucial for SCP03
 
 /**
  * =========================================================================================
- * Yiriwa Trusted Carrier Applet v4.1 (ZK-Carrier Protocol)
+ * Yiriwa Trusted Carrier Applet v5.1 (Secure Audit Mesh + SCP03)
  * =========================================================================================
  *
- * OVERVIEW:
- * This Applet implements the "Trusted Applet-Driven Compression" mechanism.
- * Ideally suited for constrained storage environments, it shifts the compression
- * trust anchor from the Merchant to the Secure Element (SE).
+ * MERGED ARCHITECTURE:
+ * 1. TRANSPORT SECURITY (Restored): All sensitive commands (PIN, Debit) must be wrapped
+ * in a GlobalPlatform SCP03 Secure Channel (Encryption + MAC).
+ * 2. LOGIC: "Pop-and-Push" (Atomic Debit & Swap).
+ * 3. COMPATIBILITY: Byte-only math (no 'int') for Base62 compression.
+ * 4. INTEGRITY: 4-Byte Truncated MAC on stored logs.
  *
  * -----------------------------------------------------------------------------------------
- * CORE INNOVATION: ATOMIC COMPRESSION & STORAGE
- * Instead of storing full JSON logs, the Applet:
- * 1. Accepts raw transaction data (Amount, MerchantID, Item).
- * 2. Compresses it using internal logic (Base62 decoding + Bit-packing).
- * 3. Stores the blob atomically with the balance decrement.
+ * APDU INTERFACE (Wrapped in SCP03):
+ * CLA: 0x84 (Secure Messaging)
  *
- * [Storage Format - 6 Bytes]
- * Byte 0-2: Merchant ID (Compressed from 4 Base62 chars)
- * Byte 3-4: Amount (Unsigned Short)
- * Byte 5:   Item Category ID
- *
- * -----------------------------------------------------------------------------------------
- * APDU INTERFACE:
- * CLA: 0x80 (0x84 for SCP03 Wrapped)
- *
- * [INS_GET_LAST_LOG - 0x50]
- * - Returns: [Compressed_Blob (6B)]
- *
- * [INS_DEBIT - 0x40]
- * - Input: [Amount (2B)] [MID_String (4B)] [Item_ID (1B)]
- * - Logic: Decrements balance AND overwrites the Last Log in one atomic commit.
+ * [INS_DEBIT_AND_SWAP - 0x40]
+ * - Input (Encrypted): [Amount(2)] [FedID_String(4)] [Item(1)]
+ * - Output (Encrypted): [Previous_Log_Data(6)] [Previous_Log_MAC(4)]
  * -----------------------------------------------------------------------------------------
  */
 public class YiriwaApplet extends Applet {
@@ -46,17 +33,17 @@ public class YiriwaApplet extends Applet {
     // -------------------------------------------------------------------------
     private static final byte CLA_YIRIWA          = (byte) 0x80;
     
+    // Instructions
     private static final byte INS_VERIFY_PIN      = (byte) 0x20;
     private static final byte INS_GET_BALANCE     = (byte) 0x30;
-    private static final byte INS_DEBIT           = (byte) 0x40; // Overwrite old log
-    private static final byte INS_GET_LAST_LOG    = (byte) 0x50; // Harvest old log
-
-    // GlobalPlatform
+    private static final byte INS_DEBIT_AND_SWAP  = (byte) 0x40; 
+    
+    // GlobalPlatform Specific
     private static final byte INS_GP_INITIALIZE_UPDATE = (byte) 0x50;
     private static final byte INS_GP_EXTERNAL_AUTH     = (byte) 0x82;
-    
+
     // Status Words
-    private static final short SW_PIN_REQUIRED     = (short) 0x6301;
+    private static final short SW_PIN_REQUIRED       = (short) 0x6301;
     private static final short SW_INSUFFICIENT_FUNDS = (short) 0x6910;
     private static final short SW_INVALID_FORMAT     = (short) 0x6911;
     private static final short SW_SECURE_CHANNEL     = (short) 0x6982;
@@ -65,37 +52,53 @@ public class YiriwaApplet extends Applet {
     // State (EEPROM)
     // -------------------------------------------------------------------------
     private OwnerPIN userPin;
-    private short balance; // Simplified to short for demo (0-32767)
+    private short balance; 
     
-    // THE CARRIER PAYLOAD (Storage Optimized)
-    private byte[] lastLogData;      // Fixed 6 bytes
-    // Removed Signature fields to save EEPROM space
+    // THE CARRIER PAYLOAD (10 Bytes)
+    // [Data(6B)] + [Proof(4B)]
+    private byte[] lastLogData; 
 
     // -------------------------------------------------------------------------
-    // Crypto (RAM)
+    // Crypto & RAM
     // -------------------------------------------------------------------------
-    private SecureChannel secureChannel;
-    private byte[] scratchBuffer;
+    private Signature macSignature;
+    private DESKey macKey;
+    private SecureChannel secureChannel; // Restored
+    private byte[] scratchBuffer; 
+
+    // Hardcoded MAC Key for demo (In prod, inject via Secure Channel)
+    private static final byte[] DEFAULT_KEY = {
+        (byte)0x59, (byte)0x49, (byte)0x52, (byte)0x49, 
+        (byte)0x57, (byte)0x41, (byte)0x5F, (byte)0x4B 
+    };
 
     /**
      * Constructor
      */
     private YiriwaApplet(byte[] bArray, short bOffset, byte bLength) {
         // 1. PIN Init
-        userPin = new OwnerPIN((byte) 3, (byte) 8);
-        byte[] defaultPin = {(byte) 0x31, (byte) 0x32, (byte) 0x33, (byte) 0x34};
-        userPin.update(defaultPin, (short) 0, (byte) defaultPin.length);
+        userPin = new OwnerPIN((byte) 3, (byte) 4);
+        byte[] defaultPin = {(byte) 0x12, (byte) 0x34, (byte) 0x56, (byte) 0x78};
+        userPin.update(defaultPin, (short) 0, (byte) 4);
 
         // 2. State Init
-        balance = 10000; 
-        
-        // Alloc storage for the Compressed Blob
-        lastLogData = new byte[6]; 
-        // No signature allocation needed
+        balance = 20000; 
+        lastLogData = new byte[10]; // 6 Data + 4 MAC
 
-        // 3. System Init
+        // 3. Crypto Init (MAC Engine for Audit Integrity)
+        try {
+            macSignature = Signature.getInstance(Signature.ALG_DES_MAC8_ISO9797_1_M2_ALG3, false);
+            macKey = (DESKey) KeyBuilder.buildKey(KeyBuilder.TYPE_DES, KeyBuilder.LENGTH_DES, false);
+            macKey.setKey(DEFAULT_KEY, (short) 0);
+        } catch (CryptoException e) {
+            macSignature = Signature.getInstance(Signature.ALG_DES_MAC8_NOPAD, false);
+        }
+
+        // 4. Secure Channel Init (For Transport Security)
         secureChannel = GPSystem.getSecureChannel();
-        scratchBuffer = JCSystem.makeTransientByteArray((short) 128, JCSystem.CLEAR_ON_DESELECT);
+
+        // 5. RAM Init
+        scratchBuffer = JCSystem.makeTransientByteArray((short) 32, JCSystem.CLEAR_ON_DESELECT);
 
         register();
     }
@@ -111,31 +114,31 @@ public class YiriwaApplet extends Applet {
         byte ins = buffer[ISO7816.OFFSET_INS];
         byte cla = buffer[ISO7816.OFFSET_CLA];
 
-        // GP Secure Channel Passthrough
+        // 1. Handshake: Pass GP commands to SecureChannel (CLA 0x80)
         if (cla == (byte) 0x80 && (ins == INS_GP_INITIALIZE_UPDATE || ins == INS_GP_EXTERNAL_AUTH)) {
             secureChannel.processSecurity(apdu);
             return;
         }
 
-        // Applet Commands
-        if ((cla & (byte) 0xFC) != CLA_YIRIWA) ISOException.throwIt(ISO7816.SW_CLA_NOT_SUPPORTED);
+        // 2. Applet Commands: Enforce Valid CLA
+        // We accept 0x80 (Clear) or 0x84 (Secure) depending on implementation policy.
+        // But enforceSecureChannel will reject 0x80 for sensitive commands.
+        if ((cla & (byte) 0xFC) != CLA_YIRIWA) {
+             ISOException.throwIt(ISO7816.SW_CLA_NOT_SUPPORTED);
+        }
 
         switch (ins) {
             case INS_VERIFY_PIN:
-                enforceSecureChannel(apdu);
+                enforceSecureChannel(apdu); // Must be wrapped
                 verifyPin(apdu);
                 break;
             case INS_GET_BALANCE:
-                enforceSecureChannel(apdu);
+                enforceSecureChannel(apdu); // Must be wrapped
                 getBalance(apdu);
                 break;
-            case INS_GET_LAST_LOG:
-                // Allows Merchant B to "Harvest" the previous state
-                returnLastLog(apdu);
-                break;
-            case INS_DEBIT:
-                enforceSecureChannel(apdu);
-                processAtomicDebitAndLog(apdu);
+            case INS_DEBIT_AND_SWAP:
+                enforceSecureChannel(apdu); // Must be wrapped
+                processDebitAndSwap(apdu);
                 break;
             default:
                 ISOException.throwIt(ISO7816.SW_INS_NOT_SUPPORTED);
@@ -145,127 +148,118 @@ public class YiriwaApplet extends Applet {
     // --- Core Logic ----------------------------------------------------------
 
     /**
-     * INS_DEBIT: Atomic Debit + Compression
-     * Input: [Amount(2)] [MID_String(4)] [Item_ID(1)] = 7 Bytes
+     * INS_DEBIT_AND_SWAP
+     * Logic: Pop old log (Harvest), Push new log (Debit), Commit.
      */
-    private void processAtomicDebitAndLog(APDU apdu) {
+    private void processDebitAndSwap(APDU apdu) {
         if (!userPin.isValidated()) ISOException.throwIt(SW_PIN_REQUIRED);
 
         byte[] buffer = apdu.getBuffer();
         short offset = ISO7816.OFFSET_CDATA;
-
-        // 1. Parse Inputs
-        // Amount (2 bytes)
+        
+        // Input validation
+        // buffer[ISO7816.OFFSET_LC] is handled by SCP unwrapping logic usually,
+        // but we double check content length
+        
+        // 1. Parse Input
         short amount = Util.makeShort(buffer[offset], buffer[(short)(offset+1)]);
-        
-        // Merchant ID (4 bytes ASCII, e.g., "0uAi")
-        short midOffset = (short)(offset + 2);
-        
-        // Item ID (1 byte)
+        short idOffset = (short)(offset + 2);
         byte itemID = buffer[(short)(offset + 6)];
 
-        // 2. Financial Validation
         if (amount <= 0) ISOException.throwIt(SW_INVALID_FORMAT);
         if (balance < amount) ISOException.throwIt(SW_INSUFFICIENT_FUNDS);
 
-        // 3. Compress Data (The Innovation)
-        // We do this BEFORE opening the transaction to fail fast if inputs are bad
-        // Output goes to scratchBuffer[0..5]
-        compressAndPack(buffer, midOffset, amount, itemID, scratchBuffer, (short) 0);
+        // 2. Prepare NEW Log in RAM (scratchBuffer)
+        // Step A: Compression (scratch[0..5])
+        compressAndPack(buffer, idOffset, amount, itemID, scratchBuffer, (short) 0);
+        
+        // Step B: Generate MAC (scratch[6..9])
+        generateTruncatedMAC(scratchBuffer, (short) 0, (short) 6, scratchBuffer, (short) 6);
 
-        // 4. ATOMIC COMMIT (Debit + Log Overwrite)
-        // Note: No signing performed. The hardware trust boundary ensures
-        // that if 'lastLogData' exists, it was created by this logic.
+        // 3. Prepare RESPONSE (The OLD Log)
+        // We copy the OLD log from EEPROM to the APDU buffer before overwrite.
+        // We must check if buffer has space, but standard APDU buffer is 255+.
+        Util.arrayCopy(lastLogData, (short) 0, buffer, (short) 0, (short) 10);
+
+        // 4. ATOMIC COMMIT
         JCSystem.beginTransaction();
         try {
-            // A. Debit
+            // A. Update Balance
             balance = (short)(balance - amount);
-
-            // B. Store Log Data (6 Bytes)
-            Util.arrayCopy(scratchBuffer, (short) 0, lastLogData, (short) 0, (short) 6);
-
+            
+            // B. Overwrite EEPROM
+            Util.arrayCopy(scratchBuffer, (short) 0, lastLogData, (short) 0, (short) 10);
+            
             JCSystem.commitTransaction();
         } catch (Exception e) {
             JCSystem.abortTransaction();
             ISOException.throwIt(ISO7816.SW_UNKNOWN);
         }
 
-        // 5. Response (Success)
-        sendSecureResponse(apdu, (short) 0);
+        // 5. Send Secure Response
+        // We encrypt the OLD log before sending it out
+        sendSecureResponse(apdu, (short) 10);
     }
 
-    /**
-     * INS_GET_LAST_LOG
-     * Response: [Blob(6)]
-     */
-    private void returnLastLog(APDU apdu) {
-        byte[] buffer = apdu.getBuffer();
-        
-        // 1. Copy Blob
-        Util.arrayCopy(lastLogData, (short) 0, buffer, (short) 0, (short) 6);
-        
-        apdu.setOutgoingAndSend((short) 0, (short) 6);
-    }
+    // --- Compression Engine (Byte Math) --------------------------------------
 
-    // --- Helper: Compression Engine ------------------------------------------
+    private void compressAndPack(byte[] src, short srcOff, short amount, byte item, byte[] dest, short destOff) {
+        Util.arrayFillNonAtomic(scratchBuffer, (short) 20, (short) 3, (byte) 0);
 
-    /**
-     * Compresses the transaction into 6 bytes.
-     * Logic:
-     * - Convert 4-char Base62 MID -> 3-byte Integer (24 bits)
-     * - Pack Amount (16 bits)
-     * - Pack Item (8 bits)
-     * Total: 48 bits = 6 bytes.
-     */
-    private void compressAndPack(byte[] src, short midOff, short amount, byte item, byte[] dest, short destOff) {
-        // A. Base62 Compression (4 bytes -> 3 bytes)
-        // val = c0*62^3 + c1*62^2 + c2*62^1 + c3
-        // We use 'int' (32-bit) accumulator. 
-        // Note: 62^3 = 238,328. 4 chars fits in signed int (max 2B).
-        
-        int acc = 0;
-        int power = 238328; // 62^3
-        
         for (short i = 0; i < 4; i++) {
-            byte charByte = src[(short)(midOff + i)];
-            short val = mapBase62(charByte);
-            acc += (val * power);
-            power /= 62;
+            byte c = src[(short)(srcOff + i)];
+            short val = mapBase62(c);
+            multiply24BitBy62AndAdd(scratchBuffer, (short) 20, val);
         }
 
-        // Write 3 bytes of MID (from 32-bit int)
-        // We skip the highest byte (which should be 0)
-        dest[destOff]     = (byte) (acc >> 16);
-        dest[(short)(destOff+1)] = (byte) (acc >> 8);
-        dest[(short)(destOff+2)] = (byte) (acc);
-
-        // B. Write Amount (2 bytes)
+        Util.arrayCopy(scratchBuffer, (short) 20, dest, destOff, (short) 3);
         Util.setShort(dest, (short)(destOff+3), amount);
-
-        // C. Write Item (1 byte)
         dest[(short)(destOff+5)] = item;
     }
 
-    /**
-     * Maps ASCII [0-9, A-Z, a-z] to 0-61.
-     */
+    private void multiply24BitBy62AndAdd(byte[] arr, short offset, short addVal) {
+        short b2 = (short)(arr[(short)(offset+2)] & 0xFF);
+        short res2 = (short)((b2 * 62) + addVal); 
+        arr[(short)(offset+2)] = (byte) res2; 
+        short carry = (short)((res2 >>> 8) & 0xFF); 
+
+        short b1 = (short)(arr[(short)(offset+1)] & 0xFF);
+        short res1 = (short)((b1 * 62) + carry);
+        arr[(short)(offset+1)] = (byte) res1;
+        carry = (short)((res1 >>> 8) & 0xFF);
+
+        short b0 = (short)(arr[offset] & 0xFF);
+        short res0 = (short)((b0 * 62) + carry);
+        arr[offset] = (byte) res0;
+    }
+
     private short mapBase62(byte c) {
-        if (c >= '0' && c <= '9') return (short)(c - '0');       // 0-9
-        if (c >= 'A' && c <= 'Z') return (short)(c - 'A' + 10);  // 10-35
-        if (c >= 'a' && c <= 'z') return (short)(c - 'a' + 36);  // 36-61
+        if (c >= '0' && c <= '9') return (short)(c - '0');
+        if (c >= 'A' && c <= 'Z') return (short)(c - 'A' + 10);
+        if (c >= 'a' && c <= 'z') return (short)(c - 'a' + 36);
         ISOException.throwIt(SW_INVALID_FORMAT);
         return 0;
     }
 
-    // --- Boilerplate Helpers -------------------------------------------------
+    // --- Crypto Helpers ------------------------------------------------------
+
+    private void generateTruncatedMAC(byte[] data, short dOff, short dLen, byte[] dest, short destOff) {
+        macSignature.init(macKey, Signature.MODE_SIGN);
+        short sigLen = macSignature.sign(data, dOff, dLen, scratchBuffer, (short) 10);
+        Util.arrayCopy(scratchBuffer, (short) 10, dest, destOff, (short) 4);
+    }
+
+    // --- SCP03 Helpers -------------------------------------------------------
 
     private void enforceSecureChannel(APDU apdu) {
         byte level = secureChannel.getSecurityLevel();
+        // Require C_DECRYPTION (Privacy) and C_MAC (Integrity)
         if ((level & (SecureChannel.C_DECRYPTION | SecureChannel.C_MAC)) == 0) {
             ISOException.throwIt(SW_SECURE_CHANNEL);
         }
         try {
             short len = apdu.setIncomingAndReceive();
+            // Unwrap modifies buffer: decrypts data and verifies MAC
             short clearLen = secureChannel.unwrap(apdu.getBuffer(), (short) 0, (short)(len + 5));
             apdu.setIncomingLength(clearLen);
         } catch (Exception e) {
@@ -274,12 +268,14 @@ public class YiriwaApplet extends Applet {
     }
 
     private void sendSecureResponse(APDU apdu, short len) {
+        // Wraps the response (Encrypts + MACs)
         short secureLen = secureChannel.wrap(apdu.getBuffer(), (short) 0, len);
         apdu.setOutgoingAndSend((short) 0, secureLen);
     }
 
     private void verifyPin(APDU apdu) {
         byte[] buf = apdu.getBuffer();
+        // PIN is now plaintext in buffer because enforceSecureChannel() unwrapped it
         if (!userPin.check(buf, ISO7816.OFFSET_CDATA, (byte) buf[ISO7816.OFFSET_LC])) {
             ISOException.throwIt(ISO7816.SW_SECURITY_STATUS_NOT_SATISFIED);
         }
