@@ -5,13 +5,12 @@ import * as fs from 'fs';
 
 /**
  * =========================================================================================
- * Yiriwa Offline Protocol (YOP) v4.1 - Merchant Sync Gateway
+ * Yiriwa Gateway v5.1 (Dumb Pipe)
  * =========================================================================================
- * * Acts as the bridge between Android SoftPOS and Hyperledger Fabric.
- * * HANDLES:
- * 1. Batch receiving of offline transactions.
- * 2. Invoking the 'SettleWithHarvest' chaincode function.
- * 3. Managing Merchant MSP Identities (Wallets).
+ * * UPDATES:
+ * 1. Accepts "Dumb" Hex Blobs (20 chars / 10 bytes) from Android POS.
+ * 2. No local processing/validation of blobs.
+ * 3. Forwards directly to Chaincode 'SettleWithHarvest' for decompression.
  */
 
 const app = express();
@@ -20,26 +19,20 @@ app.use(express.json());
 const PORT = 3000;
 const CHANNEL_NAME = 'yiriwa-channel';
 const CHAINCODE_NAME = 'yiriwa-cc';
-// In production, this comes from the authenticated Merchant's JWT or API Key
 const MERCHANT_USER = 'merchantB_admin'; 
 
-// Helper to connect to Fabric
+// --- Fabric Connection Helper ---
 async function connectToNetwork(userId: string) {
-    // Load connection profile
     const ccpPath = path.resolve(__dirname, '..', 'connection-org1.json');
     const ccp = JSON.parse(fs.readFileSync(ccpPath, 'utf8'));
-
-    // Create a new file system based wallet for managing identities.
     const walletPath = path.join(process.cwd(), 'wallet');
     const wallet = await Wallets.newFileSystemWallet(walletPath);
 
-    // Check if user exists
     const identity = await wallet.get(userId);
     if (!identity) {
-        throw new Error(`An identity for the user "${userId}" does not exist in the wallet`);
+        throw new Error(`Identity "${userId}" not found in wallet`);
     }
 
-    // Create a new gateway for connecting to our peer node.
     const gateway = new Gateway();
     await gateway.connect(ccp, { 
         wallet, 
@@ -58,7 +51,7 @@ async function connectToNetwork(userId: string) {
  * Payload: { 
  * merchantId: "9xB2", 
  * transactions: [ 
- * { cardId: "12345678", amount: 120, harvestedBlob: "0000..." } 
+ * { cardId: "12345678", amount: 120, harvestedBlob: "AABBCCDDEEFF00112233" } 
  * ] 
  * }
  */
@@ -77,21 +70,26 @@ app.post('/api/v1/sync/batch', async (req, res) => {
 
     let gateway;
     try {
-        // Connect as the Merchant (or Admin acting for them)
         const networkObj = await connectToNetwork(MERCHANT_USER);
         const contract = networkObj.contract;
         gateway = networkObj.gateway;
 
         for (const tx of transactions) {
             try {
-                // v4.1 Protocol: SettleWithHarvest
-                // We submit the CURRENT transaction details + the PREVIOUS blob found on card.
-                console.log(`[Tx] Settle Card: ${tx.cardId} ($${tx.amount}) + Harvest: ${tx.harvestedBlob || "None"}`);
+                // v5.1 Protocol: 
+                // The POS sends us a 20-char Hex String (10 bytes).
+                // We pass it blindly to the chaincode.
                 
-                // Chaincode Args: SettleWithHarvest(ctx, cardId, currentTxAmount, harvestedBlobHex)
-                // Note: harvestedBlob must be a hex string. If null, send empty string.
                 const blobArg = tx.harvestedBlob || "";
+                
+                // Logging for debug
+                if (blobArg.length === 20) {
+                    console.log(`[Tx] Card ${tx.cardId}: Settling $${tx.amount} + Archiving History (10B Blob)`);
+                } else {
+                    console.log(`[Tx] Card ${tx.cardId}: Settling $${tx.amount} (Genesis/Empty Blob)`);
+                }
 
+                // Chaincode: SettleWithHarvest(ctx, cardId, currentTxAmount, harvestedBlobHex)
                 const resultBuffer = await contract.submitTransaction(
                     'SettleWithHarvest',
                     tx.cardId,
@@ -99,12 +97,6 @@ app.post('/api/v1/sync/batch', async (req, res) => {
                     blobArg
                 );
                 
-                const resultJson = JSON.parse(resultBuffer.toString());
-                // Optional: Log the decompressed history returned by the chaincode event
-                if (resultJson.auditLog) {
-                    console.log(`   -> Ledger Archived: ${resultJson.auditLog}`);
-                }
-
                 successCount++;
             } catch (err) {
                 console.error(`   -> Failed: ${err.message}`);
@@ -130,21 +122,6 @@ app.post('/api/v1/sync/batch', async (req, res) => {
     });
 });
 
-/**
- * Endpoint: /api/v1/wallet/:cardId
- */
-app.get('/api/v1/wallet/:cardId', async (req, res) => {
-    try {
-        const { gateway, contract } = await connectToNetwork(MERCHANT_USER);
-        const result = await contract.evaluateTransaction('GetWallet', req.params.cardId);
-        gateway.disconnect();
-        
-        res.json(JSON.parse(result.toString()));
-    } catch (err) {
-        res.status(404).json({ error: err.message });
-    }
-});
-
 app.listen(PORT, () => {
-    console.log(`Yiriwa Gateway v4.1 running on http://localhost:${PORT}`);
+    console.log(`Yiriwa Gateway v5.1 running on http://localhost:${PORT}`);
 });
