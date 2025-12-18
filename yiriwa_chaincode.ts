@@ -1,14 +1,13 @@
 import { Context, Contract, Info, Returns, Transaction } from 'fabric-contract-api';
-import * as crypto from 'crypto';
 
 /**
  * =========================================================================================
- * Yiriwa Offline Protocol (YOP) v4.1 - Settlement Chaincode
+ * Yiriwa Offline Protocol (YOP) v5.1 - Settlement Chaincode
  * =========================================================================================
- * FEATURES:
- * 1. Validates & Settles current offline transactions (Merchant B).
- * 2. Decompresses & Archives historical logs carried by the user (Merchant A).
- * 3. Implements the Server-Side Expansion of the "Applet Compression" schema.
+ * * UPDATES:
+ * 1. Handles v5.1 Applet Payload (10 Bytes: 6 Data + 4 MAC).
+ * 2. Performs On-Chain Decompression (POS is now "dumb").
+ * 3. Archives the MAC Proof for dispute resolution.
  */
 
 // --- Data Models ---
@@ -28,18 +27,33 @@ class UserWallet {
 
 class HarvestedAuditLog {
     public docType: string = 'audit_log';
-    public sourceBlob: string; // The 6-byte hex
-    public decodedMerchantId: string;
-    public decodedAmount: number;
-    public decodedItem: number;
-    public uploadedBy: string; // Merchant B (The Carrier's destination)
+    public rawBlob: string;       // Full 10 bytes (Hex)
+    public macProof: string;      // Last 4 bytes (Integrity Check)
+    public compressedData: string;// First 6 bytes
+    
+    // Decompressed Context
+    public merchantId: string;
+    public amount: number;
+    public itemId: number;
+    
+    public uploadedBy: string; 
     public timestamp: string;
 
-    constructor(blob: string, mid: string, amt: number, item: number, uploader: string) {
-        this.sourceBlob = blob;
-        this.decodedMerchantId = mid;
-        this.decodedAmount = amt;
-        this.decodedItem = item;
+    constructor(
+        fullBlob: string, 
+        mac: string, 
+        data: string, 
+        mid: string, 
+        amt: number, 
+        item: number, 
+        uploader: string
+    ) {
+        this.rawBlob = fullBlob;
+        this.macProof = mac;
+        this.compressedData = data;
+        this.merchantId = mid;
+        this.amount = amt;
+        this.itemId = item;
         this.uploadedBy = uploader;
         this.timestamp = new Date().toISOString();
     }
@@ -48,7 +62,6 @@ class HarvestedAuditLog {
 @Info({title: 'YiriwaOfflineContract', description: 'Decompression & Settlement for ZK-Carrier Protocol'})
 export class YiriwaContract extends Contract {
 
-    // Base62 Alphabet (Must match Applet & Android Client)
     private static BASE62_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
     @Transaction()
@@ -65,7 +78,7 @@ export class YiriwaContract extends Contract {
      * This function is called by Merchant B.
      * 1. Debits the user for the CURRENT transaction (Merchant B's Sale).
      * 2. Takes the 'harvestedBlob' (from Merchant A) found on the card,
-     * decompresses it, and writes it to the permanent ledger history.
+     * splits it (Data vs MAC), decompresses the Data, and archives the MAC.
      */
     @Transaction()
     public async SettleWithHarvest(
@@ -84,7 +97,6 @@ export class YiriwaContract extends Contract {
 
         // 2. Process Current Debit (Merchant B)
         // Trust Assumption: The Merchant Peer calling this is authenticated via Fabric MSP
-        // and has verified the Card's SCP03 MAC off-chain.
         if (wallet.balance < currentTxAmount) {
             throw new Error(`Insufficient ledger balance. Wallet: ${wallet.balance}, Tx: ${currentTxAmount}`);
         }
@@ -94,52 +106,75 @@ export class YiriwaContract extends Contract {
         // 3. Process Harvested Blob (Merchant A's History)
         let auditLogMsg = "No previous log harvested.";
         
-        if (harvestedBlobHex && harvestedBlobHex.length === 12) { // 6 bytes = 12 hex chars
-            // A. Decompress
-            const expandedData = this.decompressBlob(harvestedBlobHex);
-            
-            // B. Create Audit Record
-            // We key this by the content hash or timestamp to avoid collisions
+        // Check for Genesis/Empty state (20 zeros) or null
+        const isGenesis = !harvestedBlobHex || harvestedBlobHex === "00000000000000000000" || harvestedBlobHex === "";
+        
+        if (!isGenesis) {
+            // v5.1 Expectation: 10 Bytes = 20 Hex Chars
+            if (harvestedBlobHex.length !== 20) {
+                throw new Error(`Invalid Blob Size. Expected 10 bytes (20 hex chars), got ${harvestedBlobHex.length}`);
+            }
+
+            // A. Parse Blob Structure
+            // [Data: 6 Bytes (12 chars)] + [MAC: 4 Bytes (8 chars)]
+            const dataPart = harvestedBlobHex.substring(0, 12);
+            const macPart = harvestedBlobHex.substring(12, 20);
+
+            // B. Decompress Data (On-Chain Logic)
+            const context = this.decompressBlob(dataPart);
+
+            // C. Create Audit Record
             const logId = `AUDIT_${cardId}_${ctx.stub.getTxID()}`;
             const auditRecord = new HarvestedAuditLog(
                 harvestedBlobHex,
-                expandedData.mid,
-                expandedData.amount,
-                expandedData.item,
+                macPart,
+                dataPart,
+                context.mid,
+                context.amount,
+                context.item,
                 ctx.clientIdentity.getID() // The Merchant B who uploaded it
             );
 
-            // C. Store Audit Log
+            // D. Store Audit Log
             await ctx.stub.putState(logId, Buffer.from(JSON.stringify(auditRecord)));
-            auditLogMsg = `Restored history from Merchant ${expandedData.mid} ($${expandedData.amount})`;
-        } else if (harvestedBlobHex && harvestedBlobHex !== "000000000000") {
-             // Basic validation for "empty" cards
-             throw new Error("Invalid Blob Format. Must be 12 Hex chars (6 bytes).");
+            
+            // E. Emit Recovery Event
+            const event = { 
+                type: "HISTORY_RECOVERED",
+                cardId: cardId,
+                recoveredContext: context,
+                integrityProof: macPart
+            };
+            ctx.stub.setEvent('AuditLogRecovered', Buffer.from(JSON.stringify(event)));
+            
+            auditLogMsg = `Restored history from Merchant ${context.mid} ($${context.amount})`;
         }
 
         // 4. Commit Wallet State
         await ctx.stub.putState(cardId, Buffer.from(JSON.stringify(wallet)));
 
-        // 5. Emit Event
-        const event = { cardId, newBalance: wallet.balance, auditLog: auditLogMsg };
-        ctx.stub.setEvent('TxSettled', Buffer.from(JSON.stringify(event)));
+        // 5. Return Summary
+        const result = { 
+            cardId, 
+            newBalance: wallet.balance, 
+            status: "SETTLED",
+            auditResult: auditLogMsg
+        };
 
-        return JSON.stringify(event);
+        return JSON.stringify(result);
     }
 
     /**
      * Helper: Decompression Engine
-     * Reverses the Applet's "compressAndPack" logic.
+     * Reverses the v5.1 Applet's "multiply24BitBy62AndAdd" logic
      */
-    private decompressBlob(hex: string): { mid: string, amount: number, item: number } {
-        const buffer = Buffer.from(hex, 'hex');
+    private decompressBlob(hex6Bytes: string): { mid: string, amount: number, item: number } {
+        const buffer = Buffer.from(hex6Bytes, 'hex');
 
-        // 1. Extract Merchant ID Integer (Bytes 0-2)
-        // 24-bit Integer
+        // 1. Extract Merchant ID Integer (Bytes 0-2) -> 24-bit Integer
         const midInt = (buffer[0] << 16) | (buffer[1] << 8) | buffer[2];
         
-        // 2. Extract Amount (Bytes 3-4)
-        // 16-bit Integer
+        // 2. Extract Amount (Bytes 3-4) -> 16-bit Integer
         const amount = (buffer[3] << 8) | buffer[4];
 
         // 3. Extract Item ID (Byte 5)
@@ -151,6 +186,7 @@ export class YiriwaContract extends Contract {
         let power = 238328; // 62^3
         let midString = "";
 
+        // Note: JS numbers are 64-bit float, so 24-bit bitwise logic is safe
         for (let i = 0; i < 4; i++) {
             const index = Math.floor(tempVal / power);
             midString += YiriwaContract.BASE62_CHARS.charAt(index);
