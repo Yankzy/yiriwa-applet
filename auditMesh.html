@@ -5,17 +5,13 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Yiriwa Secure Audit Mesh v5.1 - Patent Demonstration</title>
     
-    <!-- React & ReactDOM -->
     <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
     
-    <!-- Babel for JSX -->
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
     
-    <!-- Tailwind CSS -->
     <script src="https://cdn.tailwindcss.com"></script>
 
-    <!-- Custom Styles for Animation & Scrollbars -->
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;800&family=JetBrains+Mono:wght@400;700&display=swap');
 
@@ -75,6 +71,21 @@
         // --- PROTOCOL LOGIC ---
         const BASE62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
+        // MAPPING: Convert strings to byte IDs and back
+        const ITEM_MAP = {
+            1: "Drill",
+            2: "Saw",
+            3: "Coffee",
+            4: "Hammer"
+        };
+
+        const ITEM_REVERSE_MAP = {
+            "Drill": 1,
+            "Saw": 2,
+            "Coffee": 3,
+            "Hammer": 4
+        };
+
         // Decompression (Blockchain Side)
         const decompressBlob = (hex10Bytes) => {
             if (!hex10Bytes || hex10Bytes.length !== 20) return null;
@@ -84,7 +95,10 @@
             
             const midInt = (buffer[0] << 16) | (buffer[1] << 8) | buffer[2];
             const amount = (buffer[3] << 8) | buffer[4];
-            const item = buffer[5];
+            
+            // FIX: Look up the Item Name from the Map using the byte ID
+            const itemCode = buffer[5];
+            const item = ITEM_MAP[itemCode] || "Unknown";
             
             let tempVal = midInt;
             let power = 238328; 
@@ -111,7 +125,11 @@
             const b2 = acc & 0xFF;
             const b3 = (amount >> 8) & 0xFF;
             const b4 = amount & 0xFF;
-            const b5 = item & 0xFF;
+            
+            // FIX: Convert String Item to Byte ID
+            let itemID = typeof item === 'string' ? (ITEM_REVERSE_MAP[item] || 0) : item;
+            const b5 = itemID & 0xFF;
+
             const dataHex = [b0, b1, b2, b3, b4, b5].map(b => b.toString(16).padStart(2,'0')).join('');
             const macHex = Math.floor(Math.random() * 0xFFFFFFFF).toString(16).padStart(8, '0');
             return (dataHex + macHex).toUpperCase();
@@ -164,7 +182,7 @@
 
         function AuditMeshSimulation() {
             const [step, setStep] = useState(0); 
-            const [isSwapping, setIsSwapping] = useState(false); // Fix for stuck processing state
+            const [isSwapping, setIsSwapping] = useState(false);
             const [cardState, setCardState] = useState({
                 balance: 1000.00,
                 blob: "00000000000000000000",
@@ -194,7 +212,7 @@
             };
 
             const executeAtomicSwap = () => {
-                setIsSwapping(true); // Start loading
+                setIsSwapping(true); 
 
                 const poppedBlob = cardState.blob;
                 setHarvestedBlob(poppedBlob);
@@ -213,7 +231,7 @@
                     setTimeout(() => {
                         settleOnBlockchain(poppedBlob, txB.amount);
                         setStep(4);
-                        setIsSwapping(false); // End loading
+                        setIsSwapping(false); 
                     }, 800);
                 }, 1000);
             };
@@ -270,7 +288,7 @@
                                         <div className="space-y-4">
                                             <div className="p-4 bg-slate-50 rounded-xl border border-slate-100">
                                                 <div className="text-xs font-bold text-slate-400 uppercase mb-1">Selling Item</div>
-                                                <div className="font-mono text-xl font-bold">${txA.amount} <span className="text-slate-400 text-sm font-normal">Drill</span></div>
+                                                <div className="font-mono text-xl font-bold">${txA.amount} <span className="text-slate-400 text-sm font-normal">{txA.item}</span></div>
                                             </div>
                                             <button onClick={processMerchantA} className="w-full py-4 bg-orange-600 hover:bg-orange-700 text-white rounded-xl font-bold shadow-md flex items-center justify-center gap-2 transition-transform active:scale-95">
                                                 <Icons.CreditCard size={18} /> Tap to Pay
@@ -305,7 +323,7 @@
                                         
                                         <div className="p-4 bg-slate-50 rounded-xl border border-slate-100 mb-4">
                                             <div className="text-xs font-bold text-slate-400 uppercase mb-1">Selling Item</div>
-                                            <div className="font-mono text-xl font-bold">${txB.amount} <span className="text-slate-400 text-sm font-normal">Coffee</span></div>
+                                            <div className="font-mono text-xl font-bold">${txB.amount} <span className="text-slate-400 text-sm font-normal">{txB.item}</span></div>
                                         </div>
 
                                         <div className="p-3 bg-yellow-50 rounded-xl border border-yellow-100 mb-4">
@@ -340,7 +358,7 @@
                                 <CardVisual 
                                     balance={cardState.balance} 
                                     storage={cardState.blob} 
-                                    isProcessing={isSwapping} // Fixed to use actual processing state
+                                    isProcessing={isSwapping} 
                                     label={cardState.label}
                                 />
                                 <div className="mt-8 text-center text-sm text-slate-500 px-4">
