@@ -2,12 +2,12 @@ import { Context, Contract, Info, Returns, Transaction } from 'fabric-contract-a
 
 /**
  * =========================================================================================
- * Yiriwa Offline Protocol (YOP) v5.1 - Settlement Chaincode
+ * Yiriwa Offline Protocol (YOP) v5.2 - Settlement Chaincode
  * =========================================================================================
  * * UPDATES:
- * 1. Handles v5.1 Applet Payload (10 Bytes: 6 Data + 4 MAC).
- * 2. Performs On-Chain Decompression (POS is now "dumb").
- * 3. Archives the MAC Proof for dispute resolution.
+ * 1. Handles v5.2 Applet Payload (12 Bytes: 6 Data + 4 MAC + 2 Country ISO).
+ * 2. Strips ISO Suffix before decompression.
+ * 3. Archives Geography Data (Country ISO) for analytics.
  */
 
 // --- Data Models ---
@@ -27,9 +27,10 @@ class UserWallet {
 
 class HarvestedAuditLog {
     public docType: string = 'audit_log';
-    public rawBlob: string;       // Full 10 bytes (Hex)
-    public macProof: string;      // Last 4 bytes (Integrity Check)
+    public rawBlob: string;       // Full 12 bytes (Hex)
+    public macProof: string;      // 4 bytes (Integrity Check)
     public compressedData: string;// First 6 bytes
+    public countryISO: string;    // Last 2 bytes (Geography)
     
     // Decompressed Context
     public merchantId: string;
@@ -43,6 +44,7 @@ class HarvestedAuditLog {
         fullBlob: string, 
         mac: string, 
         data: string, 
+        iso: string,
         mid: string, 
         amt: number, 
         item: number, 
@@ -51,6 +53,7 @@ class HarvestedAuditLog {
         this.rawBlob = fullBlob;
         this.macProof = mac;
         this.compressedData = data;
+        this.countryISO = iso;
         this.merchantId = mid;
         this.amount = amt;
         this.itemId = item;
@@ -75,10 +78,8 @@ export class YiriwaContract extends Contract {
     /**
      * SettleWithHarvest (The Core Logic)
      * ---------------------------------------------------------
-     * This function is called by Merchant B.
-     * 1. Debits the user for the CURRENT transaction (Merchant B's Sale).
-     * 2. Takes the 'harvestedBlob' (from Merchant A) found on the card,
-     * splits it (Data vs MAC), decompresses the Data, and archives the MAC.
+     * Expects 12 Bytes (24 Hex Chars):
+     * [Data: 6B] [MAC: 4B] [ISO: 2B]
      */
     @Transaction()
     public async SettleWithHarvest(
@@ -96,7 +97,6 @@ export class YiriwaContract extends Contract {
         const wallet: UserWallet = JSON.parse(walletData.toString());
 
         // 2. Process Current Debit (Merchant B)
-        // Trust Assumption: The Merchant Peer calling this is authenticated via Fabric MSP
         if (wallet.balance < currentTxAmount) {
             throw new Error(`Insufficient ledger balance. Wallet: ${wallet.balance}, Tx: ${currentTxAmount}`);
         }
@@ -106,19 +106,20 @@ export class YiriwaContract extends Contract {
         // 3. Process Harvested Blob (Merchant A's History)
         let auditLogMsg = "No previous log harvested.";
         
-        // Check for Genesis/Empty state (20 zeros) or null
-        const isGenesis = !harvestedBlobHex || harvestedBlobHex === "00000000000000000000" || harvestedBlobHex === "";
+        // Check for Genesis/Empty state (24 zeros) or null
+        const isGenesis = !harvestedBlobHex || harvestedBlobHex === "000000000000000000000000" || harvestedBlobHex === "";
         
         if (!isGenesis) {
-            // v5.1 Expectation: 10 Bytes = 20 Hex Chars
-            if (harvestedBlobHex.length !== 20) {
-                throw new Error(`Invalid Blob Size. Expected 10 bytes (20 hex chars), got ${harvestedBlobHex.length}`);
+            // v5.2 Expectation: 12 Bytes = 24 Hex Chars
+            if (harvestedBlobHex.length !== 24) {
+                throw new Error(`Invalid Blob Size. Expected 12 bytes (24 hex chars), got ${harvestedBlobHex.length}`);
             }
 
             // A. Parse Blob Structure
-            // [Data: 6 Bytes (12 chars)] + [MAC: 4 Bytes (8 chars)]
+            // [Data: 12 chars] [MAC: 8 chars] [ISO: 4 chars]
             const dataPart = harvestedBlobHex.substring(0, 12);
             const macPart = harvestedBlobHex.substring(12, 20);
+            const isoPart = harvestedBlobHex.substring(20, 24); // The Suffix
 
             // B. Decompress Data (On-Chain Logic)
             const context = this.decompressBlob(dataPart);
@@ -129,10 +130,11 @@ export class YiriwaContract extends Contract {
                 harvestedBlobHex,
                 macPart,
                 dataPart,
+                isoPart, // Store the ISO
                 context.mid,
                 context.amount,
                 context.item,
-                ctx.clientIdentity.getID() // The Merchant B who uploaded it
+                ctx.clientIdentity.getID()
             );
 
             // D. Store Audit Log
@@ -143,11 +145,12 @@ export class YiriwaContract extends Contract {
                 type: "HISTORY_RECOVERED",
                 cardId: cardId,
                 recoveredContext: context,
+                countryISO: isoPart, // Include geography in event
                 integrityProof: macPart
             };
             ctx.stub.setEvent('AuditLogRecovered', Buffer.from(JSON.stringify(event)));
             
-            auditLogMsg = `Restored history from Merchant ${context.mid} ($${context.amount})`;
+            auditLogMsg = `Restored history from Merchant ${context.mid} ($${context.amount}) in Region ${isoPart}`;
         }
 
         // 4. Commit Wallet State
@@ -181,12 +184,10 @@ export class YiriwaContract extends Contract {
         const item = buffer[5];
 
         // 4. Decode Base62 (Integer -> String)
-        // val = c0*62^3 + c1*62^2 + c2*62^1 + c3
         let tempVal = midInt;
         let power = 238328; // 62^3
         let midString = "";
 
-        // Note: JS numbers are 64-bit float, so 24-bit bitwise logic is safe
         for (let i = 0; i < 4; i++) {
             const index = Math.floor(tempVal / power);
             midString += YiriwaContract.BASE62_CHARS.charAt(index);
