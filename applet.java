@@ -6,7 +6,7 @@ import javacardx.crypto.*;
 import org.globalplatform.*;
 
 /**
- * YiriwaApplet - Offline Secure Wallet with Audit Harvesting
+ * YiriwaApplet - Offline Secure Wallet with Audit Harvesting V6
  * * -----------------------------------------------------------------------------
  * OVERVIEW
  * -----------------------------------------------------------------------------
