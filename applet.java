@@ -3,7 +3,7 @@ package com.yiriwa.wallet;
 import javacard.framework.*;
 import javacard.security.*;
 import javacardx.crypto.*;
-import org.globalplatform.*; 
+import org.globalplatform.*;
 
 public class YiriwaApplet extends Applet {
 
@@ -13,8 +13,12 @@ public class YiriwaApplet extends Applet {
     private static final byte CLA_YIRIWA          = (byte) 0x80;
     private static final byte INS_VERIFY_PIN      = (byte) 0x20;
     private static final byte INS_GET_BALANCE     = (byte) 0x30;
-    private static final byte INS_DEBIT_AND_SWAP  = (byte) 0x40; 
+    private static final byte INS_DEBIT_AND_SWAP  = (byte) 0x40;
     
+    // POS Status Flags (Sent in P1)
+    private static final byte POS_STATUS_OFFLINE  = (byte) 0x00;
+    private static final byte POS_STATUS_ONLINE   = (byte) 0x01;
+
     // GP Constants
     private static final byte INS_GP_INITIALIZE_UPDATE = (byte) 0x50;
     private static final byte INS_GP_EXTERNAL_AUTH     = (byte) 0x82;
@@ -24,20 +28,25 @@ public class YiriwaApplet extends Applet {
     private static final short SW_INSUFFICIENT_FUNDS = (short) 0x6910;
     private static final short SW_INVALID_FORMAT     = (short) 0x6911;
     private static final short SW_SECURE_CHANNEL     = (short) 0x6982;
+    private static final short SW_STORAGE_FULL       = (short) 0x6986;
 
     // Configuration
-    // 6 Bytes Data + 4 Bytes MAC + 2 Bytes ISO Suffix = 12 Bytes
-    private static final byte LOG_SIZE = (byte) 12; 
+    private static final short MAX_RECORDS = (short) 300;
+    private static final short LOG_SIZE    = (short) 12; 
+    // Total Buffer: 300 * 12 = 3600 Bytes
+    private static final short MAX_BUFFER_SIZE = (short) (MAX_RECORDS * LOG_SIZE);
 
     // -------------------------------------------------------------------------
     // State (EEPROM)
     // -------------------------------------------------------------------------
     private OwnerPIN userPin;
-    private short balance; 
-    private byte[] lastLogData; 
+    private short balance;
     
-    // Persistent Storage for Country ISO (e.g., 504 for Morocco)
-    private short countryISO; 
+    // NEW: Array to store up to 300 transactions
+    private byte[] transactionLogs; 
+    private short logCount; // Tracks current number of stored records
+    
+    private short countryISO;
 
     // -------------------------------------------------------------------------
     // Crypto & RAM
@@ -56,26 +65,16 @@ public class YiriwaApplet extends Applet {
      * Constructor
      */
     private YiriwaApplet(byte[] bArray, short bOffset, byte bLength) {
-        // 1. Parse Install Parameters to find Country ISO
-        // Structure: [Li][InstanceAID][Lc][Privileges][La][AppletParams]
-        
-        // Skip Instance AID
+        // 1. Parse Install Parameters
         short aidLen = bArray[bOffset];
         short privOffset = (short)(bOffset + aidLen + 1);
-        
-        // Skip Privileges
         short privLen = bArray[privOffset];
         short paramOffset = (short)(privOffset + privLen + 1);
-        
-        // Read Applet Specific Parameters (Length is at paramOffset)
         short paramLen = bArray[paramOffset];
         
-        // We expect at least 2 bytes for the Country ISO (short)
         if (paramLen >= 2) {
-            // Read 2 bytes from paramOffset + 1
             countryISO = Util.makeShort(bArray[(short)(paramOffset + 1)], bArray[(short)(paramOffset + 2)]);
         } else {
-            // Default to 0 if not supplied (or throw exception)
             countryISO = (short) 0; 
         }
 
@@ -86,7 +85,10 @@ public class YiriwaApplet extends Applet {
 
         // 3. State Init
         balance = 20000; 
-        lastLogData = new byte[LOG_SIZE]; // Now 12 Bytes
+        
+        // Allocate 3600 bytes for storage
+        transactionLogs = new byte[MAX_BUFFER_SIZE];
+        logCount = 0;
 
         // 4. Crypto Init
         try {
@@ -145,15 +147,34 @@ public class YiriwaApplet extends Applet {
 
     /**
      * INS_DEBIT_AND_SWAP
-     * Logic: Pop old log (Harvest), Push new log (Debit), Commit.
+     * P1 = 0x00 (Offline), 0x01 (Online)
      */
     private void processDebitAndSwap(APDU apdu) {
         if (!userPin.isValidated()) ISOException.throwIt(SW_PIN_REQUIRED);
 
         byte[] buffer = apdu.getBuffer();
+        byte p1 = buffer[ISO7816.OFFSET_P1]; // Get Online/Offline status
         short offset = ISO7816.OFFSET_CDATA;
         
-        // 1. Parse Input
+        // ---------------------------------------------------------------------
+        // 1. CHECK CAPACITY (Limit 300)
+        // ---------------------------------------------------------------------
+        // If we are Offline AND we hit the limit, we must block and warn.
+        // If we are Online, we are about to clear the logs anyway, so we proceed.
+        if (logCount >= MAX_RECORDS && p1 == POS_STATUS_OFFLINE) {
+            // Return human readable text "SYNC REQUIRED"
+            byte[] msg = {'S','Y','N','C',' ','R','E','Q','U','I','R','E','D'};
+            Util.arrayCopyNonAtomic(msg, (short)0, buffer, (short)0, (short)msg.length);
+            apdu.setOutgoingAndSend((short)0, (short)msg.length);
+            // We return 9000 (Success) here so the terminal reads the text, 
+            // OR we could throw SW_STORAGE_FULL. 
+            // Sending the text and then 9000 is the most "readable" way.
+            return; 
+        }
+
+        // ---------------------------------------------------------------------
+        // 2. Parse Input & Validate
+        // ---------------------------------------------------------------------
         short amount = Util.makeShort(buffer[offset], buffer[(short)(offset+1)]);
         short idOffset = (short)(offset + 2);
         byte itemID = buffer[(short)(offset + 6)];
@@ -161,47 +182,74 @@ public class YiriwaApplet extends Applet {
         if (amount <= 0) ISOException.throwIt(SW_INVALID_FORMAT);
         if (balance < amount) ISOException.throwIt(SW_INSUFFICIENT_FUNDS);
 
-        // 2. Prepare NEW Log in RAM (scratchBuffer)
-        // Step A: Compression (Bytes 0-5)
+        // ---------------------------------------------------------------------
+        // 3. Prepare NEW Log in RAM (scratchBuffer)
+        // ---------------------------------------------------------------------
         compressAndPack(buffer, idOffset, amount, itemID, scratchBuffer, (short) 0);
-        
-        // Step B: Generate MAC (Bytes 6-9)
         generateTruncatedMAC(scratchBuffer, (short) 0, (short) 6, scratchBuffer, (short) 6);
-        
-        // NEW Step C: Append Country ISO Suffix (Bytes 10-11)
         Util.setShort(scratchBuffer, (short) 10, countryISO);
 
-        // 3. Prepare RESPONSE (The OLD Log)
-        // Copy the old 12-byte log from EEPROM to APDU buffer
-        Util.arrayCopy(lastLogData, (short) 0, buffer, (short) 0, LOG_SIZE);
+        // ---------------------------------------------------------------------
+        // 4. Prepare RESPONSE (Existing Tx List)
+        // ---------------------------------------------------------------------
+        // We copy the current stored logs to the APDU buffer before we modify anything.
+        // Note: This assumes APDU buffer + Extended Length support for > 256 bytes.
+        short currentLogSizeByte = (short)(logCount * LOG_SIZE);
+        
+        // Copy entire history to APDU buffer
+        if (logCount > 0) {
+            Util.arrayCopyNonAtomic(transactionLogs, (short)0, buffer, (short)0, currentLogSizeByte);
+        }
 
-        // 4. ATOMIC COMMIT
+        // ---------------------------------------------------------------------
+        // 5. ATOMIC COMMIT
+        // ---------------------------------------------------------------------
         JCSystem.beginTransaction();
         try {
+            // A. Deduct Balance
             balance = (short)(balance - amount);
-            // Overwrite EEPROM with new 12-byte log
-            Util.arrayCopy(scratchBuffer, (short) 0, lastLogData, (short) 0, LOG_SIZE);
+
+            if (p1 == POS_STATUS_ONLINE) {
+                // --- ONLINE LOGIC ---
+                // 1. Clear the old history (essentially by resetting count)
+                // 2. Store ONLY the new transaction at index 0
+                Util.arrayCopy(scratchBuffer, (short) 0, transactionLogs, (short) 0, LOG_SIZE);
+                
+                // Zero out the rest? (Optional, but cleaner for security)
+                // For performance, we just reset the counter.
+                logCount = 1; 
+
+            } else {
+                // --- OFFLINE LOGIC ---
+                // 1. Append the new log to the end of the list
+                short newOffset = (short)(logCount * LOG_SIZE);
+                Util.arrayCopy(scratchBuffer, (short) 0, transactionLogs, newOffset, LOG_SIZE);
+                logCount++;
+            }
+
             JCSystem.commitTransaction();
         } catch (Exception e) {
             JCSystem.abortTransaction();
             ISOException.throwIt(ISO7816.SW_UNKNOWN);
         }
 
-        // 5. Send Secure Response (12 Bytes)
-        sendSecureResponse(apdu, LOG_SIZE);
+        // ---------------------------------------------------------------------
+        // 6. Send Response
+        // ---------------------------------------------------------------------
+        // Response contains the logs that existed BEFORE this transaction was added/cleared.
+        // As per requirement: "return the tx list... remove old... append new" logic 
+        // implies the response is the 'harvest'.
+        sendSecureResponse(apdu, currentLogSizeByte);
     }
 
-    // --- Compression Engine (No changes needed here) ---
-
+    // --- Compression Engine (Same as before) ---
     private void compressAndPack(byte[] src, short srcOff, short amount, byte item, byte[] dest, short destOff) {
         Util.arrayFillNonAtomic(scratchBuffer, (short) 20, (short) 3, (byte) 0);
-
         for (short i = 0; i < 4; i++) {
             byte c = src[(short)(srcOff + i)];
             short val = mapBase62(c);
             multiply24BitBy62AndAdd(scratchBuffer, (short) 20, val);
         }
-
         Util.arrayCopy(scratchBuffer, (short) 20, dest, destOff, (short) 3);
         Util.setShort(dest, (short)(destOff+3), amount);
         dest[(short)(destOff+5)] = item;
@@ -232,16 +280,13 @@ public class YiriwaApplet extends Applet {
     }
 
     // --- Crypto Helpers ---
-
     private void generateTruncatedMAC(byte[] data, short dOff, short dLen, byte[] dest, short destOff) {
         macSignature.init(macKey, Signature.MODE_SIGN);
         short sigLen = macSignature.sign(data, dOff, dLen, scratchBuffer, (short) 20);
-        // Copy only first 4 bytes
         Util.arrayCopy(scratchBuffer, (short) 20, dest, destOff, (short) 4);
     }
 
     // --- SCP03 Helpers ---
-
     private void enforceSecureChannel(APDU apdu) {
         byte level = secureChannel.getSecurityLevel();
         if ((level & (SecureChannel.C_DECRYPTION | SecureChannel.C_MAC)) == 0) {
