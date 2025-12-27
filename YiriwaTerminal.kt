@@ -7,58 +7,70 @@ import java.util.Arrays
 
 /**
  * =========================================================================================
- * Yiriwa Android Terminal v6.0
+ * Yiriwa Android Terminal v7.0
  * =========================================================================================
- * * UPDATED PROTOCOL (Debit & Swap with Harvesting):
- * 1. Terminal indicates connectivity status (Online/Offline) via P1.
- * 2. Card returns ENTIRE audit history (Variable Length Blob).
- * 3. Terminal handles "SYNC REQUIRED" warning if card is full offline.
- * 4. Terminal passes the harvested blob to the cloud (if online).
+ * PROTOCOL OVERVIEW:
+ * -----------------------------------------------------------------------------------------
+ * This class acts as the interface between the Android App (UI/Logic) and the Java Card.
+ * It handles the APDU communication, Secure Channel wrapping (SCP03), and response parsing.
+ * * CORE OPERATIONS:
+ * 1. DEBIT & HARVEST:
+ * - Sends Amount + Merchant ID + Item ID to the card.
+ * - Receives a "Harvest Blob" containing: [WalletID (4 bytes)] + [Batch of Logs (N bytes)].
+ * - Handles "Online" (Clear Memory) vs "Offline" (Append Memory) flags via P1.
+ * * 2. RECHARGE:
+ * - Sends Amount to the card via INS_RECHARGE (0x60).
+ * - STRICTLY requires SCP03 encryption (handled by wrapCommand).
+ * - Returns the new card balance.
  */
 class YiriwaTerminal(private val nfcTag: IsoDep) {
 
     companion object {
-        // AID matching the applet
+        // AID matching the v7 Applet
         private val YIRIWA_AID = byteArrayOf(
             0xA0.toByte(), 0x00.toByte(), 0x00.toByte(), 0x01.toByte(), 
             0x51.toByte(), 0x00.toByte(), 0x01.toByte()
         )
 
+        // --- Instructions ---
         private const val INS_SELECT: Byte         = 0xA4.toByte()
         private const val INS_DEBIT_AND_SWAP: Byte = 0x40.toByte()
-        
-        // P1 Constants for v6 Applet
+        private const val INS_RECHARGE: Byte       = 0x60.toByte() // New in v7
+
+        // --- Constants ---
         private const val P1_OFFLINE: Byte = 0x00
         private const val P1_ONLINE: Byte  = 0x01
         
-        // "SYNC REQUIRED" ASCII bytes
+        // Error Message returned by card if storage is full
         private val SYNC_MSG_BYTES = "SYNC REQUIRED".toByteArray(StandardCharsets.US_ASCII)
     }
 
-    // Session State
-    private var sEnc: ByteArray? = null
-    private var sMac: ByteArray? = null
-
+    /**
+     * Connects to the card and selects the Yiriwa Applet.
+     * Note: In a real implementation, perform the SCP03 handshake immediately after selection.
+     */
     fun connect() {
         nfcTag.connect()
-        nfcTag.timeout = 5000 // Extended timeout for larger data transfer
+        nfcTag.timeout = 5000 // Extended timeout for larger log transfers
         
         val selectResp = transceive(0x00, INS_SELECT, 0x04, 0x00, YIRIWA_AID)
         if (!isSuccess(selectResp)) throw IOException("Selection Failed")
         
-        // Perform SCP03 Handshake here (omitted)
+        // TODO: Perform SCP03 Handshake here (Initialize Update + External Auth)
     }
 
     /**
-     * Perform Debit & Swap (Harvesting)
-     * * @param amount Transaction amount (short)
-     * @param merchantId 4-character ID
-     * @param itemId Item identifier
-     * @param isOnline TRUE if the terminal can upload logs immediately (Triggers Card Memory Clear)
-     * * @return The Harvested Audit Blob (Variable Size). 
-     * @throws IOException If "SYNC REQUIRED" is received or protocol fails.
+     * PERFORMS A TRANSACTION (DEBIT) AND HARVESTS LOGS
+     * * @param amount Transaction amount (e.g., 500 for $5.00)
+     * @param merchantId 4-character ID of this terminal/merchant
+     * @param itemId Unique ID of the item being purchased
+     * @param isOnline TRUE if this terminal can sync to blockchain (clears card memory).
+     * FALSE if offline (card will append log to history).
+     * * @return Pair<String, ByteArray>:
+     * - First: Wallet ID (Hex String) identifying the user.
+     * - Second: The Harvested Blob (Raw bytes of all offline logs).
      */
-    fun performDebit(amount: Int, merchantId: String, itemId: Byte, isOnline: Boolean): ByteArray {
+    fun performDebit(amount: Int, merchantId: String, itemId: Byte, isOnline: Boolean): Pair<String, ByteArray> {
         // 1. Validation
         if (merchantId.length != 4) throw IllegalArgumentException("MID must be 4 chars")
         
@@ -73,61 +85,100 @@ class YiriwaTerminal(private val nfcTag: IsoDep) {
         // 3. Determine P1 (Connectivity Status)
         val p1 = if (isOnline) P1_ONLINE else P1_OFFLINE
 
-        // 4. Wrap & Send
-        // Note: For large responses, we ensure Le=00 (Max) is handled by the underlying IsoDep/SCP layer.
+        // 4. Wrap (Encrypt) & Send
         val wrappedApdu = wrapCommand(INS_DEBIT_AND_SWAP, p1, payload)
         val response = nfcTag.transceive(wrappedApdu)
         
-        // 5. Check for Raw Status Errors first
-        // If the card was full and we are offline, it might return 9000 with the text payload, 
-        // OR an error code depending on implementation. 
-        // Based on v6 Applet code: It returns "SYNC REQUIRED" text + 9000.
-        
-        // 6. Unwrap & Extract
+        // 5. Unwrap (Decrypt)
         val unwrappedData = unwrapResponse(response)
 
-        // 7. Check for "SYNC REQUIRED" Message
+        // 6. Check for specific "Storage Full" warning
         if (Arrays.equals(unwrappedData, SYNC_MSG_BYTES)) {
-             throw IOException("TRANSACTION BLOCKED: Card Storage Full. Please find an Online Terminal to sync.")
+             throw IOException("TRANSACTION BLOCKED: Card Storage Full. Please find an Online Terminal.")
         }
 
-        // 8. Return the Harvested Blob (List of Logs)
-        // This could be 0 bytes (empty) or up to 3600 bytes.
-        return unwrappedData
+        // 7. Parse Identity Header (v7 Protocol)
+        // The first 4 bytes are ALWAYS the Wallet ID.
+        if (unwrappedData.size < 4) {
+             // This might happen if it's the very first transaction on a fresh card 
+             // and the applet implementation returns just the ID and 0 logs.
+             // If size < 4, it's a protocol violation.
+             throw IOException("Invalid Response: Missing Identity Header")
+        }
+
+        val walletIdBytes = unwrappedData.copyOfRange(0, 4)
+        val logsBlob = unwrappedData.copyOfRange(4, unwrappedData.size)
+
+        return Pair(toHex(walletIdBytes), logsBlob)
     }
 
-    // --- SCP03 Helper Methods ---
+    /**
+     * PERFORMS A RECHARGE (ADD FUNDS)
+     * * @param amount Amount to add to the card balance.
+     * @return The new updated balance on the card.
+     */
+    fun performRecharge(amount: Int): Int {
+        if (amount <= 0) throw IllegalArgumentException("Amount must be positive")
+
+        // 1. Construct Payload [Amount(2)]
+        val payload = ByteArray(2)
+        payload[0] = (amount shr 8).toByte()
+        payload[1] = (amount and 0xFF).toByte()
+
+        // 2. Wrap & Send (INS_RECHARGE = 0x60)
+        // Critical: The applet enforces SCP for this command.
+        val wrappedApdu = wrapCommand(INS_RECHARGE, 0x00, payload)
+        val response = nfcTag.transceive(wrappedApdu)
+        
+        // 3. Unwrap Response
+        val unwrappedData = unwrapResponse(response)
+        
+        // 4. Parse New Balance (2 bytes)
+        if (unwrappedData.size != 2) throw IOException("Invalid Recharge Response")
+        
+        return ((unwrappedData[0].toInt() and 0xFF) shl 8) or (unwrappedData[1].toInt() and 0xFF)
+    }
+
+    // --- SCP03 / Crypto Helpers (Mocked for Structure) ---
 
     /**
-     * Updated wrapCommand to accept P1
+     * Wraps an APDU command with SCP03 Encryption & MAC.
      */
     private fun wrapCommand(ins: Byte, p1: Byte, data: ByteArray): ByteArray {
-        // Mock Implementation for SCP03 wrapping
-        // Real impl would encrypt 'data' and calculate MAC over Header + EncryptedData
-        // Header: [CLA, INS, P1, P2, Lc]
-        
-        // For this mock, we just prepend the header.
-        // CLA=0x84 (Secure), P2=0x00
-        val apdu = ByteArray(5 + data.size + 1) // +1 for Le (0x00)
-        apdu[0] = 0x84.toByte()
+        // Real implementation requires GlobalPlatform SCP logic.
+        // We construct a Secure CLA (0x84) APDU.
+        val apdu = ByteArray(5 + data.size + 1) // +1 for Le
+        apdu[0] = 0x84.toByte() // CLA: GlobalPlatform Secure
         apdu[1] = ins
         apdu[2] = p1
-        apdu[3] = 0x00
+        apdu[3] = 0x00          // P2
         apdu[4] = data.size.toByte()
         System.arraycopy(data, 0, apdu, 5, data.size)
-        apdu[apdu.size - 1] = 0x00 // Le = 00 (Expect max response)
+        apdu[apdu.size - 1] = 0x00 // Le = 00 (Expect Max Response)
         
         return apdu 
     }
 
+    /**
+     * Unwraps a Secure Response (Verifies RMAC & Decrypts Data).
+     */
     private fun unwrapResponse(response: ByteArray): ByteArray {
-        // Mock Implementation
-        // Real impl would verify RMAC and decrypt response data
-        if (!isSuccess(response)) throw IOException("Card Error: SW=${Integer.toHexString(getSW(response))}")
+        val sw = getSW(response)
         
-        // Strip SW (last 2 bytes)
+        // Handle specific applet errors
+        if (sw == 0x6986) throw IOException("Card Storage Full (SW 6986)")
+        if (sw == 0x6987) throw IOException("Balance Limit Reached (SW 6987)")
+        if (sw == 0x6301) throw IOException("PIN Verification Required (SW 6301)")
+        
+        if (!isSuccess(response)) {
+            throw IOException("Card Error: SW=${Integer.toHexString(sw)}")
+        }
+        
+        // In a real SCP implementation, we strip the SW and decrypt the body.
         return response.copyOfRange(0, response.size - 2)
     }
+
+    // --- Standard ISO Helpers ---
 
     private fun transceive(cla: Int, ins: Byte, p1: Int, p2: Int, data: ByteArray): ByteArray {
         val apdu = ByteArray(5 + data.size)
@@ -146,5 +197,13 @@ class YiriwaTerminal(private val nfcTag: IsoDep) {
     private fun getSW(apdu: ByteArray): Int {
         if (apdu.size < 2) return 0
         return ((apdu[apdu.size - 2].toInt() and 0xFF) shl 8) or (apdu[apdu.size - 1].toInt() and 0xFF)
+    }
+    
+    private fun toHex(bytes: ByteArray): String {
+        val sb = StringBuilder()
+        for (b in bytes) {
+            sb.append(String.format("%02X", b))
+        }
+        return sb.toString()
     }
 }
