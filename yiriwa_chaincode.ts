@@ -2,196 +2,222 @@ import { Context, Contract, Info, Returns, Transaction } from 'fabric-contract-a
 
 /**
  * =========================================================================================
- * Yiriwa Offline Protocol (YOP) v5.2 - Settlement Chaincode
+ * Yiriwa Offline Protocol (YOP) v7.0 - Batch Settlement Chaincode
  * =========================================================================================
- * * UPDATES:
- * 1. Handles v5.2 Applet Payload (12 Bytes: 6 Data + 4 MAC + 2 Country ISO).
- * 2. Strips ISO Suffix before decompression.
- * 3. Archives Geography Data (Country ISO) for analytics.
+ * * CORE LOGIC:
+ * 1. PARSE: Extracts Wallet ID (Header) + List of Logs (Body).
+ * 2. VERIFY: Checks that Blob Identity matches Wallet Identity.
+ * 3. DEDUPLICATE: Checks Ledger for existing Tx IDs (Idempotency).
+ * 4. SETTLE: Debits the *current* online transaction + Archives *offline* history.
  */
 
 // --- Data Models ---
 
 class UserWallet {
     public docType: string = 'wallet';
-    public cardId: string;
+    public walletId: string; // Hex String (e.g., "1A2B3C4D")
     public balance: number;
     public lastUpdated: string;
 
-    constructor(cardId: string, initialBalance: number) {
-        this.cardId = cardId;
+    constructor(walletId: string, initialBalance: number) {
+        this.walletId = walletId;
         this.balance = initialBalance;
         this.lastUpdated = new Date().toISOString();
     }
 }
 
-class HarvestedAuditLog {
+class AuditLog {
     public docType: string = 'audit_log';
-    public rawBlob: string;       // Full 12 bytes (Hex)
-    public macProof: string;      // 4 bytes (Integrity Check)
-    public compressedData: string;// First 6 bytes
-    public countryISO: string;    // Last 2 bytes (Geography)
+    public compositeKey: string; // Unique ID (Wallet + TxCode)
     
-    // Decompressed Context
+    // Decompressed Data
     public merchantId: string;
     public amount: number;
     public itemId: number;
+    public countryISO: string;
     
+    // Security
+    public macProof: string;
+    public rawData: string;
     public uploadedBy: string; 
     public timestamp: string;
 
     constructor(
-        fullBlob: string, 
-        mac: string, 
-        data: string, 
-        iso: string,
+        key: string,
         mid: string, 
         amt: number, 
         item: number, 
+        iso: string,
+        mac: string,
+        raw: string,
         uploader: string
     ) {
-        this.rawBlob = fullBlob;
-        this.macProof = mac;
-        this.compressedData = data;
-        this.countryISO = iso;
+        this.compositeKey = key;
         this.merchantId = mid;
         this.amount = amt;
         this.itemId = item;
+        this.countryISO = iso;
+        this.macProof = mac;
+        this.rawData = raw;
         this.uploadedBy = uploader;
         this.timestamp = new Date().toISOString();
     }
 }
 
-@Info({title: 'YiriwaOfflineContract', description: 'Decompression & Settlement for ZK-Carrier Protocol'})
+@Info({title: 'YiriwaContractV7', description: 'Batch Settlement & Idempotency Engine'})
 export class YiriwaContract extends Contract {
 
     private static BASE62_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
     @Transaction()
     public async InitLedger(ctx: Context): Promise<void> {
-        const demoCardId = '12345678';
-        const wallet = new UserWallet(demoCardId, 10000);
-        await ctx.stub.putState(demoCardId, Buffer.from(JSON.stringify(wallet)));
-        console.info(`Wallet ${demoCardId} initialized`);
+        // Initialize a Demo Wallet with ID "1A2B3C4D" (Matches simulation)
+        const demoId = '1A2B3C4D';
+        const wallet = new UserWallet(demoId, 5000); // $50.00
+        await ctx.stub.putState(demoId, Buffer.from(JSON.stringify(wallet)));
+        console.info(`v7 Ledger Initialized: Wallet ${demoId} created.`);
     }
 
     /**
-     * SettleWithHarvest (The Core Logic)
+     * SettleBatch (v7.0)
      * ---------------------------------------------------------
-     * Expects 12 Bytes (24 Hex Chars):
-     * [Data: 6B] [MAC: 4B] [ISO: 2B]
+     * Payload Structure:
+     * [WalletID (8 Hex Chars)] + [Log 1 (24 Hex)] + [Log 2 (24 Hex)] ...
      */
     @Transaction()
-    public async SettleWithHarvest(
+    public async SettleBatch(
         ctx: Context, 
-        cardId: string, 
+        walletIdArg: string, // The ID claimed by the POS
         currentTxAmount: number, 
-        harvestedBlobHex: string
+        fullBlobHex: string
     ): Promise<string> {
         
-        // 1. Fetch Wallet
-        const walletData = await ctx.stub.getState(cardId);
+        // 1. Validate Input
+        if (!fullBlobHex || fullBlobHex.length < 8) {
+            throw new Error("Invalid Blob: Too short to contain Header.");
+        }
+
+        // 2. Identity Verification (Header Check)
+        // Extract Header (First 4 Bytes = 8 Hex Chars)
+        const headerWalletId = fullBlobHex.substring(0, 8).toUpperCase();
+        
+        // Ensure the blob belongs to the wallet being debited
+        if (headerWalletId !== walletIdArg.toUpperCase()) {
+            throw new Error(`Identity Mismatch: Blob belongs to ${headerWalletId}, but Tx is for ${walletIdArg}`);
+        }
+
+        // 3. Fetch & Update Wallet Balance (Online Tx)
+        const walletData = await ctx.stub.getState(headerWalletId);
         if (!walletData || walletData.length === 0) {
-            throw new Error(`Wallet ${cardId} does not exist`);
+            throw new Error(`Wallet ${headerWalletId} not found`);
         }
         const wallet: UserWallet = JSON.parse(walletData.toString());
 
-        // 2. Process Current Debit (Merchant B)
         if (wallet.balance < currentTxAmount) {
-            throw new Error(`Insufficient ledger balance. Wallet: ${wallet.balance}, Tx: ${currentTxAmount}`);
+            throw new Error(`Insufficient Funds: Balance ${wallet.balance} < ${currentTxAmount}`);
         }
+        
+        // Apply Debit
         wallet.balance -= currentTxAmount;
         wallet.lastUpdated = new Date().toISOString();
+        await ctx.stub.putState(headerWalletId, Buffer.from(JSON.stringify(wallet)));
 
-        // 3. Process Harvested Blob (Merchant A's History)
-        let auditLogMsg = "No previous log harvested.";
+        // 4. Batch Processing Loop (The "Zipper")
+        const logsBlob = fullBlobHex.substring(8); // Strip Header
+        const LOG_LENGTH = 24; // 12 Bytes * 2 Hex Chars
         
-        // Check for Genesis/Empty state (24 zeros) or null
-        const isGenesis = !harvestedBlobHex || harvestedBlobHex === "000000000000000000000000" || harvestedBlobHex === "";
-        
-        if (!isGenesis) {
-            // v5.2 Expectation: 12 Bytes = 24 Hex Chars
-            if (harvestedBlobHex.length !== 24) {
-                throw new Error(`Invalid Blob Size. Expected 12 bytes (24 hex chars), got ${harvestedBlobHex.length}`);
+        let processedCount = 0;
+        let skippedCount = 0;
+        let totalAmountRecovered = 0;
+
+        // Loop through chunks of 24 characters
+        for (let i = 0; i < logsBlob.length; i += LOG_LENGTH) {
+            const chunk = logsBlob.substring(i, i + LOG_LENGTH);
+            if (chunk.length !== LOG_LENGTH) break; // Ignore malformed/trailing bits
+
+            // A. Parse Log Parts
+            const dataHex = chunk.substring(0, 12); // Compressed Data
+            const macHex  = chunk.substring(12, 20); // MAC
+            const isoHex  = chunk.substring(20, 24); // Country ISO
+
+            // B. Decompress
+            const txContext = this.decompressLog(dataHex);
+            
+            // C. Generate Composite Key (Idempotency ID)
+            // Key = WalletID + RawDataHex (The compressed data is unique per tx due to timestamp)
+            const uniqueLogKey = `LOG_${headerWalletId}_${dataHex}`;
+
+            
+
+            // D. Idempotency Check (The "Existence Proof")
+            const existingLog = await ctx.stub.getState(uniqueLogKey);
+            
+            if (existingLog && existingLog.length > 0) {
+                // DUPLICATE DETECTED
+                skippedCount++;
+                continue; // Skip this log, do not double count
             }
 
-            // A. Parse Blob Structure
-            // [Data: 12 chars] [MAC: 8 chars] [ISO: 4 chars]
-            const dataPart = harvestedBlobHex.substring(0, 12);
-            const macPart = harvestedBlobHex.substring(12, 20);
-            const isoPart = harvestedBlobHex.substring(20, 24); // The Suffix
-
-            // B. Decompress Data (On-Chain Logic)
-            const context = this.decompressBlob(dataPart);
-
-            // C. Create Audit Record
-            const logId = `AUDIT_${cardId}_${ctx.stub.getTxID()}`;
-            const auditRecord = new HarvestedAuditLog(
-                harvestedBlobHex,
-                macPart,
-                dataPart,
-                isoPart, // Store the ISO
-                context.mid,
-                context.amount,
-                context.item,
+            // E. New Record -> Archive It
+            const newLog = new AuditLog(
+                uniqueLogKey,
+                txContext.mid,
+                txContext.amount,
+                txContext.item,
+                isoHex,
+                macHex,
+                chunk,
                 ctx.clientIdentity.getID()
             );
 
-            // D. Store Audit Log
-            await ctx.stub.putState(logId, Buffer.from(JSON.stringify(auditRecord)));
+            await ctx.stub.putState(uniqueLogKey, Buffer.from(JSON.stringify(newLog)));
             
-            // E. Emit Recovery Event
-            const event = { 
-                type: "HISTORY_RECOVERED",
-                cardId: cardId,
-                recoveredContext: context,
-                countryISO: isoPart, // Include geography in event
-                integrityProof: macPart
-            };
-            ctx.stub.setEvent('AuditLogRecovered', Buffer.from(JSON.stringify(event)));
-            
-            auditLogMsg = `Restored history from Merchant ${context.mid} ($${context.amount}) in Region ${isoPart}`;
+            processedCount++;
+            totalAmountRecovered += txContext.amount;
         }
 
-        // 4. Commit Wallet State
-        await ctx.stub.putState(cardId, Buffer.from(JSON.stringify(wallet)));
-
-        // 5. Return Summary
-        const result = { 
-            cardId, 
-            newBalance: wallet.balance, 
-            status: "SETTLED",
-            auditResult: auditLogMsg
+        // 5. Emit Event & Return
+        const eventPayload = {
+            walletId: headerWalletId,
+            newLogs: processedCount,
+            duplicates: skippedCount,
+            valueRecovered: totalAmountRecovered
         };
+        ctx.stub.setEvent('BatchSettled', Buffer.from(JSON.stringify(eventPayload)));
 
-        return JSON.stringify(result);
+        return JSON.stringify({
+            status: "SUCCESS",
+            wallet: headerWalletId,
+            newBalance: wallet.balance,
+            batchReport: {
+                processed: processedCount,
+                skipped: skippedCount,
+                recoveredValue: totalAmountRecovered
+            }
+        });
     }
 
     /**
-     * Helper: Decompression Engine
-     * Reverses the v5.1 Applet's "multiply24BitBy62AndAdd" logic
+     * Helper: Decompression Logic (Base62 Reverse Map)
      */
-    private decompressBlob(hex6Bytes: string): { mid: string, amount: number, item: number } {
+    private decompressLog(hex6Bytes: string): { mid: string, amount: number, item: number } {
         const buffer = Buffer.from(hex6Bytes, 'hex');
 
-        // 1. Extract Merchant ID Integer (Bytes 0-2) -> 24-bit Integer
+        // Bytes 0-2: Merchant ID Int
         const midInt = (buffer[0] << 16) | (buffer[1] << 8) | buffer[2];
-        
-        // 2. Extract Amount (Bytes 3-4) -> 16-bit Integer
+        // Bytes 3-4: Amount
         const amount = (buffer[3] << 8) | buffer[4];
-
-        // 3. Extract Item ID (Byte 5)
+        // Byte 5: Item ID
         const item = buffer[5];
 
-        // 4. Decode Base62 (Integer -> String)
+        // Base62 Decode
         let tempVal = midInt;
-        let power = 238328; // 62^3
+        let power = 238328; 
         let midString = "";
-
+        
         for (let i = 0; i < 4; i++) {
             const index = Math.floor(tempVal / power);
             midString += YiriwaContract.BASE62_CHARS.charAt(index);
-            
             tempVal = tempVal % power;
             power = Math.floor(power / 62);
         }
@@ -201,8 +227,8 @@ export class YiriwaContract extends Contract {
 
     @Transaction(false)
     @Returns('string')
-    public async GetWallet(ctx: Context, cardId: string): Promise<string> {
-        const data = await ctx.stub.getState(cardId);
+    public async GetWallet(ctx: Context, walletId: string): Promise<string> {
+        const data = await ctx.stub.getState(walletId);
         return data ? data.toString() : "{}";
     }
 }
